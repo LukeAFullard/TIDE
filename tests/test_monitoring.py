@@ -125,7 +125,12 @@ def test_horizon_wide_false_alarm_rate():
     for fit_seed in range(n_fits):
         rng = np.random.default_rng(600 + fit_seed)
         historical = make_historical(rng, n_years=20)  # see comment above
-        config = TideConfig(bin_days=30, detrend_mode="additive", n_bootstrap=300)
+        # n_bootstrap must comfortably resolve alpha_per_check (0.005 here).
+        # At 300 draws the finest attainable p-value is 1/301 = 0.0033, only
+        # 1.5x below the threshold being measured, so the "ever flagged" rate
+        # would be governed by bootstrap granularity as much as by the data.
+        # MonitoringSeries now warns about exactly this.
+        config = TideConfig(bin_days=30, detrend_mode="additive", n_bootstrap=2000)
         fit = fit_historical(historical, "date", "value", config)
         for career in range(n_careers_per_fit):
             series = MonitoringSeries(fit, alpha_total=alpha_total, n_years_horizon=n_years_horizon)

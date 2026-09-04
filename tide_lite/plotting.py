@@ -27,6 +27,20 @@ def _new_ax(figsize=(9, 5)):
     return ax
 
 
+def _fmt_p(p, n_reference):
+    """Format a bootstrap p-value without ever printing 0.000.
+
+    The smallest value this test can produce is 1/(n_reference+1), so a
+    p-value at that floor means "at least this extreme", not zero. Naive
+    .3f rounding rendered the default 0.0005 as "p=0.000", which reads as
+    certainty the method cannot deliver.
+    """
+    floor = 1.0 / (n_reference + 1)
+    if p <= floor:
+        return f"p<{floor:.2g}"
+    return f"p={p:.3f}" if p >= 0.001 else f"p={p:.2g}"
+
+
 def plot_envelope(fit: TideFit, result: TideResult, envelope: "dict | None" = None,
                    treatment_label: str = "treatment period",
                    mark_significant_bins: bool = True, alpha: float = 0.05,
@@ -46,15 +60,24 @@ def plot_envelope(fit: TideFit, result: TideResult, envelope: "dict | None" = No
     the estimated departure span and marks the recovery bin, if any.
     """
     ax = ax or _new_ax()
-    env = envelope or get_envelope(fit)
+    # Put the envelope on the SAME trend basis as the treatment curve. The
+    # fit detrends every historical year back to the first year's level, so
+    # an unshifted envelope sits at that level while result.treatment_curve
+    # is plotted at its own year's. On a record with real drift the two are
+    # simply offset by the trend, and the picture then contradicts the
+    # p-value: a perfectly normal year (p=0.40) on a 15-year record drifting
+    # 0.6/year sat above the band in all 13 bins.
+    env = envelope or get_envelope(fit, year_index=result.treatment_year_index)
     x = env["bins"]
     for row in env["year_curves"]:
         ax.plot(x, row, color="steelblue", alpha=0.25, linewidth=1)
+    band_label = (f"{env.get('lower_q', 0.1):.0%}-{env.get('upper_q', 0.9):.0%} "
+                  f"percentile ({env.get('method', 'bootstrap')})")
     ax.fill_between(x, env["lower"], env["upper"], color="steelblue", alpha=0.15,
-                     label="10th-90th percentile (bootstrap)")
+                     label=band_label)
     ax.plot(x, env["median_curve"], color="steelblue", linewidth=2, label="historical median")
     ax.plot(x, result.treatment_curve, color="firebrick", linewidth=2.5,
-            label=f"{treatment_label} (p={result.p_value:.3f})")
+            label=f"{treatment_label} ({_fmt_p(result.p_value, result.n_reference)})")
     if mark_significant_bins:
         sig = bin_significant(result, alpha=alpha)
         if np.any(sig):
@@ -68,10 +91,16 @@ def plot_envelope(fit: TideFit, result: TideResult, envelope: "dict | None" = No
         if departure.recovered:
             ax.axvline(departure.recovered_at_bin, color="darkgreen", linewidth=1.5,
                        linestyle=":", label=f"recovered by bin {departure.recovered_at_bin}")
-    ax.set_xlabel("bin")
+    ax.set_xlabel(f"bin ({fit.config.bin_days}-day)")
     ax.set_ylabel(fit.value_col)
-    ax.set_title("Treatment period vs. historical envelope")
+    title = "Treatment period vs. historical envelope"
+    if fit.trend["applied"]:
+        title += (f"\n(envelope shifted to year index "
+                  f"{result.treatment_year_index} for the fitted trend of "
+                  f"{fit.trend['slope_per_year']:+.3g}/year)")
+    ax.set_title(title)
     ax.legend()
+    ax.figure.tight_layout()
     return ax
 
 
@@ -83,10 +112,18 @@ def plot_sequential(fit: TideFit, results, envelope: "dict | None" = None, ax=No
     results: the list returned by sequential_test().
     """
     ax = ax or _new_ax()
-    env = envelope or get_envelope(fit)
+    # Every event shares one envelope, so it can only sit on one trend
+    # basis. Use the events' own indices when they agree, and say so in the
+    # title when they don't rather than drawing a band that matches none of
+    # them. (With no trend applied the shift is zero and this is moot.)
+    year_indices = {r.result.treatment_year_index for r in results}
+    common = next(iter(year_indices)) if len(year_indices) == 1 else None
+    env = envelope or get_envelope(fit, year_index=common)
     x = env["bins"]
+    band_label = (f"{env.get('lower_q', 0.1):.0%}-{env.get('upper_q', 0.9):.0%} "
+                  f"percentile ({env.get('method', 'bootstrap')})")
     ax.fill_between(x, env["lower"], env["upper"], color="steelblue", alpha=0.15,
-                     label="10th-90th percentile (bootstrap)")
+                     label=band_label)
     ax.plot(x, env["median_curve"], color="steelblue", linewidth=2, label="historical median")
 
     sig_labeled, nonsig_labeled = False, False
@@ -104,10 +141,15 @@ def plot_sequential(fit: TideFit, results, envelope: "dict | None" = None, ax=No
         ax.annotate(row.label, (x[-1], row.result.treatment_curve[-1]),
                     fontsize=8, color=color, xytext=(4, 0), textcoords="offset points")
 
-    ax.set_xlabel("bin")
+    ax.set_xlabel(f"bin ({fit.config.bin_days}-day)")
     ax.set_ylabel(fit.value_col)
-    ax.set_title("Sequential: every event vs. historical envelope")
+    title = "Sequential: every event vs. historical envelope"
+    if fit.trend["applied"] and common is None:
+        title += ("\n(events span different years under a fitted trend -- "
+                  "compare p-values, not distance from the band)")
+    ax.set_title(title)
     ax.legend()
+    ax.figure.tight_layout()
     return ax
 
 
@@ -121,7 +163,14 @@ def plot_cumulative(results, alpha: float = 0.05, ax=None):
     """
     ax = ax or _new_ax(figsize=(8, 4.5))
     labels = [r.label for r in results]
-    effects = [r.result.effect_size for r in results]
+    # The trend-adjusted effect size is the one the p-value (and therefore
+    # the marker colour) is computed on. Plotting the raw one against
+    # trend-based colours makes a recovering series look like it is still
+    # drifting whenever the historical record has a fitted trend. Identical
+    # to effect_size when no trend was applied.
+    trend_applied = any(r.result.effect_size != r.result.effect_size_trend_adjusted
+                        for r in results)
+    effects = [r.result.effect_size_trend_adjusted for r in results]
     colors = ["firebrick" if r.significant else "steelblue" for r in results]
     x = np.arange(len(results))
 
@@ -130,7 +179,8 @@ def plot_cumulative(results, alpha: float = 0.05, ax=None):
     ax.axhline(0, color="black", linewidth=0.8, linestyle="--", label="historical median (fully recovered)")
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=20, ha="right")
-    ax.set_ylabel("effect size (original units)")
+    ax.set_ylabel("effect size, trend-adjusted (original units)"
+                  if trend_applied else "effect size (original units)")
     ax.set_title("Cumulative: effect size over time")
 
     from matplotlib.lines import Line2D

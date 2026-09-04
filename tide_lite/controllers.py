@@ -21,7 +21,9 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from .engine import TideFit, TideResult, test_treatment, holm_bonferroni
+from .engine import (
+    TideFit, TideResult, test_treatment, holm_bonferroni, _resolve_rng,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +55,7 @@ class SequentialResultRow:
 
 
 def sequential_test(fit: TideFit, events: list[SequentialEvent],
-                     alpha: float = 0.05) -> list[SequentialResultRow]:
+                     alpha: float = 0.05, rng=None) -> list[SequentialResultRow]:
     """Test each event independently against the same historical fit, then
     apply Holm-Bonferroni across the whole set.
 
@@ -62,7 +64,15 @@ def sequential_test(fit: TideFit, events: list[SequentialEvent],
     into another's window silently breaks independence. This function
     does not check for overlap because it only receives already-aggregated
     per-event dataframes, not a shared raw timeline.
+
+    rng: None (fresh entropy), an int (seed), or a numpy Generator. Pass a
+    seed for anything you intend to report -- every p-value here comes from
+    a Monte Carlo null, so two runs of the same data differ in the third
+    decimal, and a borderline event can flip which side of alpha it lands
+    on between runs. One Generator is threaded through every event so the
+    whole family is reproducible together.
     """
+    rng = _resolve_rng(rng)
     if fit.trend["applied"]:
         missing = [ev.label for ev in events if ev.year_index is None]
         if missing:
@@ -75,7 +85,7 @@ def sequential_test(fit: TideFit, events: list[SequentialEvent],
             )
     raw = [
         (ev.label, test_treatment(fit, ev.treatment_df, mode="prediction",
-                                   treatment_year_index=ev.year_index))
+                                   treatment_year_index=ev.year_index, rng=rng))
         for ev in events
     ]
     p_values = np.array([r.p_value for _, r in raw])
@@ -109,12 +119,18 @@ class CumulativeResultRow:
 
 
 def cumulative_test(fit: TideFit, windows: list[CumulativeWindow],
-                     alpha: float = 0.05) -> list[CumulativeResultRow]:
+                     alpha: float = 0.05, rng=None) -> list[CumulativeResultRow]:
     """Test each window against the SAME fit (same baseline, no re-fitting,
     no correction). fit is not mutated or refit between calls -- reusing
     one TideFit across every window is what makes this "cumulative" rather
     than a fresh Standard test each time.
+
+    rng: None (fresh entropy), an int (seed), or a numpy Generator. Seed it
+    for reportable results -- see sequential_test. It matters more here:
+    first_recovery() keys off which windows cleared alpha, so an unseeded
+    borderline window can move the declared recovery point between runs.
     """
+    rng = _resolve_rng(rng)
     if fit.trend["applied"]:
         missing = [w.label for w in windows if w.year_index is None]
         if missing:
@@ -128,7 +144,7 @@ def cumulative_test(fit: TideFit, windows: list[CumulativeWindow],
         CumulativeResultRow(
             label=w.label,
             result=(r := test_treatment(fit, w.treatment_df, mode="prediction",
-                                         treatment_year_index=w.year_index)),
+                                         treatment_year_index=w.year_index, rng=rng)),
             significant=bool(r.p_value < alpha),
         )
         for w in windows
@@ -161,6 +177,13 @@ def first_recovery(results: list[CumulativeResultRow],
     window" behavior if you want it, but 2+ is recommended for anything
     you'd actually report.
     """
+    if consecutive_required < 1:
+        raise ValueError(
+            f"consecutive_required must be >= 1, got {consecutive_required}. "
+            f"With 0 the rule is vacuous -- an empty run trivially satisfies "
+            f"'all non-significant', so it declared recovery at the first "
+            f"window no matter how significant that window was."
+        )
     n = len(results)
     for i in range(n - consecutive_required + 1):
         window = results[i:i + consecutive_required]

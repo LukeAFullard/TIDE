@@ -7,9 +7,9 @@
       "label": "2020",
       "year_index": 10,
       "alpha_used": 0.005,
-      "p_value": 0.24687656171914044,
-      "effect_size": 0.10145846949169535,
-      "effect_size_trend_adjusted": 0.10145846949169535,
+      "p_value": 0.3543228385807096,
+      "effect_size": 0.21576169378796184,
+      "effect_size_trend_adjusted": 0.21576169378796184,
       "flagged": false
     },
     {
@@ -17,9 +17,9 @@
       "label": "2021",
       "year_index": 11,
       "alpha_used": 0.005,
-      "p_value": 0.4682658670664668,
-      "effect_size": -0.06828112233462136,
-      "effect_size_trend_adjusted": -0.06828112233462136,
+      "p_value": 0.22188905547226387,
+      "effect_size": 0.1613780504809359,
+      "effect_size_trend_adjusted": 0.1613780504809359,
       "flagged": false
     },
     {
@@ -28,8 +28,8 @@
       "year_index": 12,
       "alpha_used": 0.005,
       "p_value": 0.0004997501249375312,
-      "effect_size": 2.927278400361349,
-      "effect_size_trend_adjusted": 2.927278400361349,
+      "effect_size": 2.876049969428289,
+      "effect_size_trend_adjusted": 2.876049969428289,
       "flagged": true
     }
   ]

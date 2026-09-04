@@ -55,6 +55,27 @@ def estimate_power(fit: TideFit, effect_sizes, alpha: float = 0.05,
     effect size and simulation -- this is the expensive part; keep
     n_simulations modest (a few hundred) unless you have time to spare.
     rng: None (fresh entropy), an int (seed), or a numpy Generator.
+
+    WHAT THIS IS CONDITIONAL ON -- read before quoting a number from it.
+    The simulated "treatment periods" are drawn from the same block pool
+    that builds the null, so this measures power against a year that
+    behaves exactly like a resampled composite of your historical years.
+    A real new year does not: it can carry a whole-year level shift the
+    bootstrap averages away (see engine.py's calibration section), and it
+    is measured against a median/MAD curve estimated from a finite record.
+    Two consequences:
+
+      - power at effect_size=0 comes back at ~alpha BY CONSTRUCTION. That
+        is arithmetic, not evidence that the test is calibrated on your
+        data. Check fit.between_year_var_frac for that.
+      - the detectable effect sizes reported here are the OPTIMISTIC end.
+        Treat a size this curve calls marginal as "not reliably
+        detectable" rather than borderline.
+
+    It is still the right tool for its actual question -- "is the effect I
+    care about anywhere near detectable with the record I have, or am I
+    running a test that cannot answer me?" -- which is usually settled by
+    an order of magnitude, not a few percent.
     """
     rng = _resolve_rng(rng)
     n_bins = len(fit.bins)
@@ -104,7 +125,9 @@ def estimate_power_sequential(fit: TideFit, effect_sizes, n_events: int,
 
 def sensitivity_grid(historical_df: pd.DataFrame, treatment_df: pd.DataFrame,
                       date_col: str, value_col: str, base_config: TideConfig,
-                      variations: dict, mode: str = "prediction") -> pd.DataFrame:
+                      variations: dict, mode: str = "prediction",
+                      treatment_year_index: "int | None" = None,
+                      rng=None) -> pd.DataFrame:
     """Re-fit and re-test under each single-parameter variation (holding
     everything else at base_config), to check whether a REAL result is
     stable to defensible alternative choices. A Phase 6 tool -- run once
@@ -113,21 +136,39 @@ def sensitivity_grid(historical_df: pd.DataFrame, treatment_df: pd.DataFrame,
     variations: {TideConfig field name: [alternative values to try]}
     e.g. {"bin_days": [7, 30], "detrend_mode": ["additive", "log_additive"]}
 
+    treatment_year_index: passed through to every variant so they are all
+    tested on the same trend basis. Leaving it None is only safe when no
+    variant detects a trend -- otherwise each variant falls back to its own
+    default, and variants that drop a different number of historical years
+    would silently be compared at different points on the trend line.
+
+    rng: seed or Generator, threaded through every variant. Without it the
+    grid mixes real sensitivity to a setting with Monte Carlo noise between
+    runs, which is the one thing this table exists to tell apart.
+
     One row per variant: p_value, effect_size, test_statistic, and how
     many historical years survived that variant's completeness filter
     (watch this -- a variant that quietly drops years isn't a fair
-    comparison).
+    comparison). Also n_bins, trend_applied and between_year_var_frac,
+    since a variant can change the answer by changing those rather than by
+    the setting you meant to vary.
     """
+    rng = _resolve_rng(rng)
     rows = []
 
     def _run(cfg: TideConfig, tag: str):
         fit = fit_historical(historical_df, date_col, value_col, cfg)
-        result = test_treatment(fit, treatment_df, mode=mode)
+        result = test_treatment(fit, treatment_df, mode=mode,
+                                 treatment_year_index=treatment_year_index, rng=rng)
         rows.append({
             "variant": tag, "p_value": result.p_value,
             "effect_size": result.effect_size,
+            "effect_size_trend_adjusted": result.effect_size_trend_adjusted,
             "test_statistic": result.test_statistic,
             "n_historical_years": len(fit.years_used),
+            "n_bins": len(fit.bins),
+            "trend_applied": fit.trend["applied"],
+            "between_year_var_frac": round(fit.between_year_var_frac, 3),
         })
 
     _run(base_config, "base")

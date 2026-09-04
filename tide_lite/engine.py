@@ -3,7 +3,11 @@ TIDE lite -- core engine (Phase 2 of the rebuild plan).
 
 One job: given historical "normal" data and one treatment period, decide
 whether the treatment period is unusual, accounting for seasonality and
-year-to-year autocorrelation, without assuming a distribution.
+WITHIN-year autocorrelation, without assuming a distribution.
+
+Read the "Calibration and its limits" section below before trusting a
+p-value near alpha: within-year dependence is handled, but whole-year
+("this was a wet year") dependence is NOT, and that has a measured cost.
 
 Method: historical years are aligned onto a common day-of-year axis and
 binned (weekly/monthly). The typical seasonal shape is the bin-wise median
@@ -38,6 +42,48 @@ not just as changelog entries:
    one synthetic year, which is why block_length_bins is deliberately
    shorter than a full year (see TideConfig).
 
+CALIBRATION AND ITS LIMITS (measured by simulation, not derived on paper)
+
+Feeding the pipeline fresh synthetic "normal" years and counting how often
+it wrongly flags them, at a nominal alpha of 0.05, 900 trials per cell:
+
+    historical years   within-year noise only   + whole-year level shifts
+    ----------------   ----------------------   -------------------------
+            10                  0.054                 0.112 - 0.130
+            20                  0.042                 0.072 - 0.081
+            40                  0.018                      --
+
+So: when year-to-year variation is just accumulated within-year wiggle,
+the test is well calibrated and gets conservative on long records. When
+the data ALSO carries genuine whole-year level shifts -- a wet year
+sitting high from January to December, which is the norm in hydrology --
+the test runs at roughly twice its nominal false-positive rate with 10
+historical years, and about 1.5x with 20.
+
+The mechanism is design point 2 below, seen from the other side. A
+synthetic "normal year" is stitched from ~4 independently drawn sub-year
+chunks, so a whole-year offset present in every real year is averaged
+away in the null: measured directly, the SD of the annual mean residual
+across synthetic draws is about half that of the real historical years
+once a year-level effect exists. The null is too narrow, so real years
+look more extreme than they should.
+
+This is a real property of the method, not a bug to patch out. Resampling
+whole years instead is worse (design point 2). Adding a resampled
+whole-year offset back onto each draw was prototyped and did NOT fix the
+calibration -- with N historical years the offset distribution is itself
+capped at the most extreme year ever observed, while a genuinely new year
+exceeds all N of them about 2/(N+1) of the time. Short of a parametric
+model of the year-level distribution -- which would give back the
+distributional assumption this whole approach exists to avoid -- the
+honest move is to measure the exposure and report it.
+
+fit_historical therefore reports `between_year_var_frac` (the share of
+residual variance carried by whole-year level shifts) and warns when it
+is high on a short record. Low value -> the top table column applies.
+High value -> the bottom one does; prefer more historical years and treat
+p-values near alpha as indicative.
+
 Other design choices, and why:
   - Median + MAD (median absolute deviation, 1.4826x-corrected to be
     comparable to a standard deviation) instead of mean + SD: robust to
@@ -57,6 +103,8 @@ Other design choices, and why:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import warnings
+
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
@@ -119,15 +167,28 @@ def mann_kendall_test(values) -> tuple[float, float]:
     return float(s), float(p)
 
 
-def sens_slope(values) -> float:
-    """Sen's slope estimator (Sen 1968): median of all pairwise slopes."""
+def sens_slope(values, times=None) -> float:
+    """Sen's slope estimator (Sen 1968): median of all pairwise slopes.
+
+    `times` is the x-axis the slope is expressed per unit of. It MUST be
+    passed whenever the observations are not evenly spaced -- historical
+    records routinely have gaps (a year dropped by the completeness
+    filter, or simply never sampled), and using the positional index as
+    a stand-in for the calendar silently rescales the slope. With
+    years [2000..2004, 2010..2014] and a true drift of 0.5/year, the
+    positional version returns ~0.87/year; passing the real calendar
+    offsets returns ~0.5/year.
+    """
     x = np.asarray(values, dtype="float64")
     n = len(x)
+    t = np.arange(n, dtype="float64") if times is None else np.asarray(times, dtype="float64")
+    if len(t) != n:
+        raise ValueError(f"times has length {len(t)} but values has length {n}.")
     slopes = [
-        (x[j] - x[i]) / (j - i)
+        (x[j] - x[i]) / (t[j] - t[i])
         for i in range(n - 1)
         for j in range(i + 1, n)
-        if not (np.isnan(x[i]) or np.isnan(x[j]))
+        if not (np.isnan(x[i]) or np.isnan(x[j]) or t[j] == t[i])
     ]
     return float(np.median(slopes)) if slopes else 0.0
 
@@ -145,6 +206,14 @@ def holm_bonferroni(p_values: np.ndarray, alpha: float = 0.05) -> np.ndarray:
     correction, two different families of tests being corrected.
     """
     p_values = np.asarray(p_values, dtype="float64")
+    if not 0 < alpha < 1:
+        raise ValueError(f"alpha must be strictly between 0 and 1, got {alpha}.")
+    if np.any(np.isnan(p_values)):
+        raise ValueError(
+            "holm_bonferroni received NaN p-values. Drop or mask them first -- "
+            "a NaN is missing evidence, and silently sorting it into the "
+            "sequence would change every other test's threshold."
+        )
     n = len(p_values)
     order = np.argsort(p_values)
     sorted_p = p_values[order]
@@ -174,6 +243,11 @@ def _resolve_rng(rng) -> np.random.Generator:
 # Config and result containers
 # ---------------------------------------------------------------------------
 
+_VALID_DETREND_MODES = {"additive", "log_additive", "none"}
+_VALID_AGG = {"median", "mean"}
+_VALID_MODES = {"prediction", "confidence"}
+
+
 @dataclass
 class TideConfig:
     """The Phase 1 decisions, in one place, with defaults documented."""
@@ -194,6 +268,49 @@ class TideConfig:
     pool_window_radius: int = 1     # pool each position with its +/- this-many
                                      # immediate neighbors (see _extract_block_pool)
 
+    def __post_init__(self):
+        """Reject misspelled options loudly. Every one of these used to fall
+        through silently to a DIFFERENT analysis: detrend_mode="log" ran an
+        additive detrend with no log transform at all, and agg="avg" only
+        surfaced later as a pandas AttributeError from deep inside a groupby.
+        """
+        if self.detrend_mode not in _VALID_DETREND_MODES:
+            raise ValueError(
+                f"detrend_mode must be one of {sorted(_VALID_DETREND_MODES)}, "
+                f"got {self.detrend_mode!r}."
+            )
+        if self.agg not in _VALID_AGG:
+            raise ValueError(
+                f"agg must be one of {sorted(_VALID_AGG)}, got {self.agg!r}."
+            )
+        if self.bin_days < 1 or self.bin_days > 365:
+            raise ValueError(f"bin_days must be between 1 and 365, got {self.bin_days}.")
+        if not 0 < self.mk_alpha < 1:
+            raise ValueError(f"mk_alpha must be strictly between 0 and 1, got {self.mk_alpha}.")
+        if not 0 <= self.max_missing_frac < 1:
+            raise ValueError(
+                f"max_missing_frac must be in [0, 1), got {self.max_missing_frac}."
+            )
+        if self.n_bootstrap < 1:
+            raise ValueError(f"n_bootstrap must be >= 1, got {self.n_bootstrap}.")
+        if self.block_length_bins is not None and self.block_length_bins < 1:
+            raise ValueError(
+                f"block_length_bins must be >= 1 or None (auto), got {self.block_length_bins}."
+            )
+        if self.pool_window_radius < 0:
+            raise ValueError(
+                f"pool_window_radius must be >= 0, got {self.pool_window_radius}."
+            )
+
+    @property
+    def min_attainable_p(self) -> float:
+        """The smallest p-value this many bootstrap draws can ever produce:
+        (0 + 1) / (n_bootstrap + 1). Any threshold below this is
+        unreachable -- the test can never flag anything, at any effect
+        size. Guards elsewhere in the package compare against this.
+        """
+        return 1.0 / (self.n_bootstrap + 1)
+
 
 @dataclass
 class TideFit:
@@ -213,6 +330,35 @@ class TideFit:
     trend: dict
     date_col: str
     value_col: str
+    median_curve_raw: np.ndarray = None   # bin-wise median BEFORE detrending, in the
+                                           # same space as median_curve (log if log mode).
+                                           # effect_size is measured against this so the
+                                           # "raw" number means "vs. the historical period's
+                                           # own typical level", not "vs. the level at the
+                                           # START of the record" -- see test_treatment.
+    between_year_var_frac: float = 0.0     # share of residual variance carried by
+                                           # WHOLE-YEAR level shifts (wet year / dry year)
+                                           # rather than within-year wiggle. High values
+                                           # mean the block bootstrap's null is too narrow
+                                           # and p-values are anti-conservative -- see the
+                                           # module docstring's calibration section.
+
+    @property
+    def first_year(self) -> int:
+        """Calendar year the trend axis is measured from (years_used[0])."""
+        return int(self.years_used[0])
+
+    def year_index_for(self, calendar_year: int) -> int:
+        """Convert a calendar year into the `treatment_year_index` that
+        test_treatment / Sequential / Cumulative / MonitoringSeries expect:
+        the offset in CALENDAR years from the first historical year.
+
+            fit.year_index_for(2024)   # -> 24 if history starts in 2000
+
+        Use this instead of len(fit.years_used) -- the two agree only when
+        the historical record has no gaps.
+        """
+        return int(calendar_year) - self.first_year
 
 
 @dataclass
@@ -252,6 +398,13 @@ class TideResult:
     treatment_curve: np.ndarray
     bins: np.ndarray
     n_reference: int                # Monte Carlo draws used for the null
+    treatment_year_index: int = 0   # resolved calendar-year offset from the first
+                                     # historical year that this period was tested at.
+                                     # Plotting needs it to put the envelope on the
+                                     # same trend basis as the treatment curve.
+    missing_bins: np.ndarray = None  # bool per bin: no treatment data there. Those
+                                     # bins have bin_p_values = NaN and take no part
+                                     # in the test -- they are not evidence either way.
 
 
 # ---------------------------------------------------------------------------
@@ -371,11 +524,30 @@ def _max_window_mean(bin_devs: np.ndarray, run_length: int) -> tuple[float, int]
     within one period.
     """
     n = len(bin_devs)
+    if run_length < 1:
+        raise ValueError(f"run_length must be >= 1, got {run_length}.")
     if run_length > n:
         raise ValueError(f"run_length ({run_length}) exceeds the number of bins ({n}).")
+    # Windows containing a missing bin are EXCLUDED rather than averaged
+    # over what is present. A partial window is not comparable to the null,
+    # which always averages run_length complete bins; and np.mean of a
+    # window holding a NaN returns NaN, which np.argmax then selects as the
+    # maximum -- previously handing the sustained test a NaN statistic that
+    # no null draw could exceed, i.e. the smallest possible p-value for a
+    # window that was really just missing data.
     window_means = np.array([
         bin_devs[s:s + run_length].mean() for s in range(n - run_length + 1)
     ])
+    valid = ~np.isnan(window_means)
+    if not np.any(valid):
+        raise ValueError(
+            f"No window of {run_length} consecutive bins is free of missing "
+            f"data in the treatment period, so the sustained-departure test "
+            f"has nothing comparable to the null to measure. Use a shorter "
+            f"run_length, coarser bins (larger bin_days), or more complete "
+            f"treatment data."
+        )
+    window_means = np.where(valid, window_means, -np.inf)
     best = int(np.argmax(window_means))
     return float(window_means[best]), best
 
@@ -416,14 +588,21 @@ def fit_historical(df: pd.DataFrame, date_col: str, value_col: str,
         _check_positive_for_log(matrix, "the historical data")
     work = np.log(matrix) if use_log else matrix.copy()
 
+    # The trend axis is CALENDAR years elapsed since the first historical
+    # year, not the position of each year in the list. Those coincide only
+    # for a gapless record; with any year missing (never sampled, or dropped
+    # by the completeness filter above) the positional version silently
+    # rescales the slope -- see sens_slope's docstring for a worked case.
+    year_offsets = np.asarray(years_used, dtype="float64") - float(years_used[0])
+    median_curve_raw = np.nanmedian(work, axis=0)
+
     yearly_summary = np.nanmedian(work, axis=1)
     mk_s, mk_p = mann_kendall_test(yearly_summary)
     slope = 0.0
     trend_applied = False
     if config.detrend_mode != "none" and mk_p < config.mk_alpha:
-        slope = sens_slope(yearly_summary)
-        year_index = np.arange(len(years_used))
-        work = work - (slope * year_index)[:, None]
+        slope = sens_slope(yearly_summary, times=year_offsets)
+        work = work - (slope * year_offsets)[:, None]
         trend_applied = True
 
     median_curve = np.nanmedian(work, axis=0)
@@ -441,6 +620,30 @@ def fit_historical(df: pd.DataFrame, date_col: str, value_col: str,
         0.01 * max(np.nanmedian(np.abs(median_curve)), 1e-9)
     mad = np.where(mad == 0, fallback, mad)
 
+    # How much of the leftover variation is a WHOLE-YEAR level shift (a wet
+    # year sitting high all year) versus within-year wiggle. The bootstrap
+    # stitches each synthetic year from several independently drawn chunks,
+    # which averages whole-year shifts away -- so the larger this fraction,
+    # the narrower the null is relative to what a real new year does, and the
+    # more anti-conservative the p-value. Measured, not assumed: see the
+    # calibration table in the module docstring.
+    _year_levels = np.nanmean(residual_matrix, axis=1)
+    _total_var = float(np.nanvar(residual_matrix))
+    between_year_var_frac = (
+        float(np.clip(np.nanvar(_year_levels) / _total_var, 0.0, 1.0))
+        if _total_var > 0 else 0.0
+    )
+    if between_year_var_frac >= 0.5 and len(years_used) < 20:
+        warnings.warn(
+            f"{between_year_var_frac:.0%} of this record's residual variation is "
+            f"whole-year level shifts, and only {len(years_used)} historical years "
+            f"are available. In simulation this regime runs at roughly 2x the "
+            f"nominal false-positive rate (11-13% at a nominal 5% with 10 years). "
+            f"Treat p-values near alpha as indicative, prefer more historical "
+            f"years, and read the 'Calibration' section of USER_GUIDE.md.",
+            UserWarning, stacklevel=2,
+        )
+
     block_length_bins = config.block_length_bins or max(2, n_bins // 4)
     block_length_bins = min(block_length_bins, n_bins)
     block_pool = _extract_block_pool(residual_matrix, block_length_bins,
@@ -454,8 +657,10 @@ def fit_historical(df: pd.DataFrame, date_col: str, value_col: str,
         min_blocks_per_position=min_blocks_per_position,
         years_used=years_used, years_dropped=years_dropped,
         trend={"mk_p": mk_p, "slope_per_year": slope, "applied": trend_applied,
-               "log_space": use_log},
+               "log_space": use_log, "first_year": int(years_used[0])},
         date_col=date_col, value_col=value_col,
+        median_curve_raw=median_curve_raw,
+        between_year_var_frac=between_year_var_frac,
     )
 
 
@@ -495,6 +700,13 @@ def test_treatment(fit: TideFit, treatment_df: pd.DataFrame,
     rng = _resolve_rng(rng)
     n_bins = len(fit.bins)
 
+    if mode not in _VALID_MODES:
+        raise ValueError(
+            f"mode must be one of {sorted(_VALID_MODES)}, got {mode!r}. "
+            f"(A misspelling used to fall through to the 'confidence' branch "
+            f"and silently run a different analysis.)"
+        )
+
     pivot = _bin_and_pivot(treatment_df, fit.date_col, fit.value_col,
                             config.bin_days, config.agg)
     if len(pivot) == 0:
@@ -510,14 +722,52 @@ def test_treatment(fit: TideFit, treatment_df: pd.DataFrame,
     row = pivot.mean(axis=0) if mode == "confidence" else pivot.iloc[0]
     treatment_curve = row.reindex(fit.bins).to_numpy(dtype="float64")
 
+    # Bins the historical fit knows about but the treatment period has no
+    # data for. These carry NO information and must not be scored: an
+    # earlier version compared NaN against every null draw, and since
+    # `null >= nan` is False everywhere the bin scored 0 exceedances and
+    # came out at the SMALLEST p-value the bootstrap can produce -- so a
+    # treatment year truncated in August was reported as maximally
+    # significant in exactly the months it had no data for.
+    missing_bins = np.isnan(treatment_curve)
+    n_missing = int(missing_bins.sum())
+    if n_missing == n_bins:
+        raise ValueError(
+            "The treatment period has no data in any of the historical fit's "
+            f"{n_bins} bins. Check that treatment_df covers the same part of "
+            f"the year as the historical data and uses the same units/columns."
+        )
+    if n_missing / n_bins > config.max_missing_frac:
+        raise ValueError(
+            f"The treatment period is missing {n_missing} of {n_bins} bins "
+            f"({n_missing / n_bins:.0%}), above max_missing_frac="
+            f"{config.max_missing_frac:.0%} -- the same completeness bar "
+            f"historical years have to clear. Testing a period this sparse "
+            f"compares a few months against a whole-year null. Supply more "
+            f"complete data, use coarser bins (larger bin_days), or raise "
+            f"max_missing_frac deliberately if you accept the tradeoff."
+        )
+    if n_missing:
+        warnings.warn(
+            f"The treatment period has no data in {n_missing} of {n_bins} bins "
+            f"({fit.bins[missing_bins].tolist()}). Those bins are excluded from "
+            f"the test and their bin_p_values are NaN; the p-value is based on "
+            f"the {n_bins - n_missing} bins that do have data.",
+            UserWarning, stacklevel=2,
+        )
+
     use_log = fit.trend["log_space"]
     if use_log:
         _check_positive_for_log(treatment_curve, "treatment_df")
     work_curve = np.log(treatment_curve) if use_log else treatment_curve
 
+    # Resolved regardless of whether a trend was applied, so the result can
+    # report the basis it was tested on and plotting can match it.
+    if treatment_year_index is None:
+        # One calendar year after the LAST historical year. len(years_used)
+        # only equals that for a gapless record.
+        treatment_year_index = int(fit.years_used[-1]) - int(fit.years_used[0]) + 1
     if fit.trend["applied"]:
-        if treatment_year_index is None:
-            treatment_year_index = len(fit.years_used)
         work_curve = work_curve - fit.trend["slope_per_year"] * treatment_year_index
 
     stat_obs = _max_standardized_deviation(work_curve, fit.median_curve, fit.mad)
@@ -544,6 +794,9 @@ def test_treatment(fit: TideFit, treatment_df: pd.DataFrame,
     # exact multiple-comparisons inflation the max-statistic exists to
     # avoid) -- use bin_significant() below, which corrects properly.
     bin_p_values = (np.sum(null_bin_devs >= obs_bin_devs[None, :], axis=0) + 1) / (n_ref + 1)
+    # A bin with no treatment data gets NaN, not a p-value. See the
+    # missing_bins comment above for what the old behaviour did instead.
+    bin_p_values = np.where(missing_bins, np.nan, bin_p_values)
 
     # Sustained-departure test(s): a different question from bin_p_values
     # above -- "was there a run of run_length-or-more consecutive bins
@@ -569,13 +822,24 @@ def test_treatment(fit: TideFit, treatment_df: pd.DataFrame,
     # report both rather than picking one, since silently only reporting
     # the raw figure can look inconsistent next to a trend-adjusted p-value
     # ("why is such a small effect so significant") and vice versa.
+    # effect_size is measured against median_curve_raw -- the historical
+    # bin-wise median BEFORE detrending, i.e. the record's own typical level.
+    # It used to be measured against median_curve, which is the detrended
+    # curve and therefore sits at the level of the FIRST historical year: on
+    # a record with a real drift that made "raw" effect size grow with the
+    # length of the record rather than describe the treatment period. On a
+    # 15-year record drifting 0.6/year, a perfectly ordinary continuation of
+    # the trend reported effect_size = +9.06 against a p-value of 0.40.
+    # Fall back for a TideFit built before median_curve_raw existed (or
+    # constructed by hand): with no trend applied the two are identical.
+    baseline_raw = fit.median_curve if fit.median_curve_raw is None else fit.median_curve_raw
     if use_log:
-        effect_size = float(np.nanmedian(treatment_curve - np.exp(fit.median_curve)))
+        effect_size = float(np.nanmedian(treatment_curve - np.exp(baseline_raw)))
         effect_size_trend_adjusted = float(
             np.nanmedian(np.exp(work_curve) - np.exp(fit.median_curve))
         ) if fit.trend["applied"] else effect_size
     else:
-        effect_size = float(np.nanmedian(treatment_curve - fit.median_curve))
+        effect_size = float(np.nanmedian(treatment_curve - baseline_raw))
         effect_size_trend_adjusted = float(
             np.nanmedian(work_curve - fit.median_curve)
         ) if fit.trend["applied"] else effect_size
@@ -585,6 +849,7 @@ def test_treatment(fit: TideFit, treatment_df: pd.DataFrame,
         effect_size_trend_adjusted=effect_size_trend_adjusted, bin_p_values=bin_p_values,
         sustained=sustained,
         mode=mode, treatment_curve=treatment_curve, bins=fit.bins, n_reference=n_ref,
+        treatment_year_index=int(treatment_year_index), missing_bins=missing_bins,
     )
 
 
@@ -611,9 +876,33 @@ def bin_significant(result: TideResult, alpha: float = 0.05) -> np.ndarray:
     small global p-value means some specific bin will always survive this
     correction, or vice versa.
 
+    Bins with no treatment data (NaN p-value) are never flagged and take no
+    part in the correction -- they are missing evidence, not evidence of
+    normality, and including them would also make every other bin's
+    threshold stricter for no reason.
+
     Returns a boolean array aligned with result.bins / result.bin_p_values.
     """
-    return holm_bonferroni(result.bin_p_values, alpha=alpha)
+    p = np.asarray(result.bin_p_values, dtype="float64")
+    testable = ~np.isnan(p)
+    n_testable = int(testable.sum())
+    out = np.zeros(len(p), dtype=bool)
+    if n_testable == 0:
+        return out
+    min_p = 1.0 / (result.n_reference + 1)
+    strictest = alpha / n_testable
+    if min_p > strictest:
+        warnings.warn(
+            f"No bin can be flagged at alpha={alpha}: the strictest "
+            f"Holm threshold across {n_testable} bins is {strictest:.5f}, but "
+            f"{result.n_reference} bootstrap draws can never produce a p-value "
+            f"below {min_p:.5f}. This returns all-False for arithmetic reasons, "
+            f"not because the data looked normal. Raise n_bootstrap to at least "
+            f"{int(np.ceil(n_testable / alpha))} to make this test resolvable.",
+            UserWarning, stacklevel=2,
+        )
+    out[testable] = holm_bonferroni(p[testable], alpha=alpha)
+    return out
 
 
 @dataclass
@@ -669,7 +958,18 @@ def estimate_departure_recovery(result: TideResult, run_length: int,
     while right + 1 < n_bins and result.bin_p_values[right + 1] < extension_alpha:
         right += 1
 
+    # "Recovered" means the next bin was measured and looked normal. A bin
+    # with no data is not evidence of recovery, so say so rather than
+    # reporting a recovery the data cannot support.
     recovered = right < n_bins - 1
+    if recovered and np.isnan(result.bin_p_values[right + 1]):
+        warnings.warn(
+            f"The bin after the estimated departure (bin "
+            f"{int(result.bins[right + 1])}) has no treatment data, so "
+            f"'recovered' here means 'the departure stopped being traceable', "
+            f"not 'the variable was measured back at normal'.",
+            UserWarning, stacklevel=2,
+        )
     return DepartureRecovery(
         run_length=run_length,
         departure_start_bin=int(result.bins[left]),
@@ -684,13 +984,27 @@ def estimate_departure_recovery(result: TideResult, run_length: int,
 # ---------------------------------------------------------------------------
 
 def get_envelope(fit: TideFit, lower_q: float = 0.1, upper_q: float = 0.9,
-                  method: str = "bootstrap", rng=None) -> dict:
+                  method: str = "bootstrap", year_index: "int | None" = None,
+                  rng=None) -> dict:
     """method="bootstrap" (default): percentiles across many Monte Carlo
     synthetic years, using the same resampling as test_treatment -- smooth,
     and backed by the same mechanism that produces the p-value.
     method="empirical": raw quantiles from just the N historical years --
     coarser, but literally just your own data with no resampling involved.
     Individual historical year curves are returned either way for overlay.
+
+    year_index: which year's trend basis to express the envelope on, as a
+    calendar-year offset from the first historical year (see
+    fit.year_index_for). This matters ONLY when a trend correction was
+    applied: the fit detrends every historical year back to the first
+    year's level, so an un-shifted envelope sits at that first year's
+    level while a treatment curve is plotted at its own year's level.
+    Overlaying the two then shows a gap that is entirely the trend --
+    on a 15-year record drifting 0.6/year, a perfectly normal 2015 (p=0.40)
+    plotted above the band in all 13 bins. Pass the treatment period's
+    year_index (plot_envelope does this automatically from the result) to
+    put both on the same basis. None leaves the envelope on the first
+    historical year's basis.
     """
     rng = _resolve_rng(rng)
     n_bins = len(fit.bins)
@@ -706,17 +1020,24 @@ def get_envelope(fit: TideFit, lower_q: float = 0.1, upper_q: float = 0.9,
         lower = np.nanquantile(fit.historical_matrix, lower_q, axis=0)
         upper = np.nanquantile(fit.historical_matrix, upper_q, axis=0)
 
+    median_curve = fit.median_curve
+    year_curves = fit.historical_matrix
+    shift = 0.0
+    if fit.trend["applied"] and year_index is not None:
+        shift = fit.trend["slope_per_year"] * float(year_index)
+        lower, upper = lower + shift, upper + shift
+        median_curve = median_curve + shift
+        year_curves = year_curves + shift
+
     if fit.trend["log_space"]:
         lower, upper = np.exp(lower), np.exp(upper)
-        year_curves = np.exp(fit.historical_matrix)
-        median_curve = np.exp(fit.median_curve)
-    else:
-        year_curves = fit.historical_matrix
-        median_curve = fit.median_curve
+        year_curves = np.exp(year_curves)
+        median_curve = np.exp(median_curve)
 
     return {
         "bins": fit.bins, "lower": lower, "upper": upper,
         "median_curve": median_curve, "year_curves": year_curves,
         "years_used": fit.years_used, "n_years": len(fit.years_used),
-        "method": method,
+        "method": method, "lower_q": lower_q, "upper_q": upper_q,
+        "year_index": year_index, "trend_shift": float(shift),
     }
