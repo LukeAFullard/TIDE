@@ -1,5 +1,6 @@
 from .engine import (
     TideConfig, TideFit, TideResult, fit_historical, test_treatment, get_envelope,
+    mann_kendall_test, sens_slope, to_day_of_year, assign_bins,
     holm_bonferroni, bin_significant, SustainedResult,
     DepartureRecovery, estimate_departure_recovery,
 )
@@ -14,6 +15,7 @@ from .plotting import plot_envelope, plot_sequential, plot_cumulative, plot_moni
 
 __all__ = [
     "TideConfig", "TideFit", "TideResult", "fit_historical", "test_treatment", "get_envelope",
+    "mann_kendall_test", "sens_slope", "to_day_of_year", "assign_bins",
     "holm_bonferroni", "bin_significant", "SustainedResult",
     "DepartureRecovery", "estimate_departure_recovery",
     "SequentialEvent", "SequentialResultRow", "sequential_test",

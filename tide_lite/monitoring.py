@@ -75,6 +75,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 import json
+import warnings
+
+import numpy as np
 
 from .engine import TideFit, test_treatment
 
@@ -94,10 +97,56 @@ class MonitoringCheck:
 class MonitoringSeries:
     def __init__(self, fit: TideFit, alpha_total: float = 0.05,
                  n_years_horizon: int = 20):
+        if not 0 < alpha_total < 1:
+            raise ValueError(
+                f"alpha_total must be strictly between 0 and 1, got {alpha_total}."
+            )
+        if n_years_horizon < 1:
+            raise ValueError(
+                f"n_years_horizon must be >= 1, got {n_years_horizon}."
+            )
         self.fit = fit
         self.alpha_total = alpha_total
         self.n_years_horizon = n_years_horizon
         self.checks: list[MonitoringCheck] = []
+
+        # Splitting the budget across a long horizon can push the per-check
+        # threshold below the finest p-value the bootstrap can resolve
+        # (1 / (n_bootstrap + 1)). Past that point .check() cannot flag
+        # ANYTHING, at any effect size -- and would have gone on returning
+        # a confident-looking flagged=False forever.
+        min_p = 1.0 / (fit.config.n_bootstrap + 1)
+        if min_p >= self.alpha_per_check:
+            needed = int(np.ceil(1.0 / self.alpha_per_check))
+            raise ValueError(
+                f"This horizon cannot flag anything. alpha_total="
+                f"{alpha_total} split across {n_years_horizon} checks gives "
+                f"alpha_per_check={self.alpha_per_check:.6f}, but "
+                f"{fit.config.n_bootstrap} bootstrap draws can never produce a "
+                f"p-value below {min_p:.6f}. Refit with "
+                f"TideConfig(n_bootstrap>={needed}), shorten n_years_horizon, "
+                f"or raise alpha_total."
+            )
+        if min_p > self.alpha_per_check / 10:
+            warnings.warn(
+                f"alpha_per_check={self.alpha_per_check:.6f} is close to the "
+                f"finest p-value {fit.config.n_bootstrap} bootstrap draws can "
+                f"resolve ({min_p:.6f}), so a flag depends on a handful of "
+                f"extreme draws. Raise n_bootstrap to at least "
+                f"{int(np.ceil(10.0 / self.alpha_per_check))} for a stable "
+                f"threshold.",
+                UserWarning, stacklevel=2,
+            )
+        if len(fit.years_used) < 20:
+            warnings.warn(
+                f"MonitoringSeries is fitted on {len(fit.years_used)} historical "
+                f"years. Its stated budget needs ~20+ to hold: in simulation a "
+                f"nominal 5% lifetime budget ran at ~17% true false-alarm rate "
+                f"with 10 historical years, 7% with 20, 3% with 30. Treat "
+                f"flags from a shorter record as indicative, not as a 5% "
+                f"guarantee -- see the module docstring.",
+                UserWarning, stacklevel=2,
+            )
 
     @property
     def alpha_per_check(self) -> float:
