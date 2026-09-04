@@ -511,16 +511,6 @@ suggests at a glance.
 
 **Other documents in this project**, and when to read them:
 
-- `METHODS_template.md` — fill this in before running a real analysis. It
-  turns every setting above into a documented decision.
-- `tide_rebuild_plan.md` — the phase-by-phase plan this project was built
-  from, including why block bootstrap was chosen over alternatives, and
-  what's deliberately *not* built (audit trails, legal-defensibility
-  documentation, a benchmark suite against other methods — all gated
-  behind an actual need, not built speculatively).
-- `ADVERSARIAL_REVIEW.md` — a self-review that found and fixed six issues
-  after the initial build, including two genuine statistical bugs. Worth
-  reading if you want to know exactly what's been checked.
 
 **The statistics, briefly, for the technically curious:**
 

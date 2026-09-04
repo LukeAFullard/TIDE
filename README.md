@@ -55,15 +55,6 @@ and a troubleshooting section for every error message the code raises.
 bottom. Swap the synthetic data generator at the top for a real
 `pd.read_csv(...)` and everything downstream is unchanged.
 
-## Before touching your real data
-
-Fill in `METHODS_template.md` (Phase 0-1 of the rebuild plan) first --
-every setting in `TideConfig` should trace back to a line in it. The full
-phase-by-phase plan (why each design choice was made, what's deliberately
-out of scope) is in `tide_rebuild_plan.md`. An adversarial self-review of
-this code, with everything found and fixed, is in `ADVERSARIAL_REVIEW.md`
--- worth reading before trusting a real result, particularly the note on
-per-fit calibration variance.
 
 ## A finding worth knowing before you interpret a real result
 
@@ -92,6 +83,4 @@ examples/
   run_example.py  -- Phase 6: full walkthrough, all four modes plotted
 QUICKSTART.md         -- 5-minute start
 USER_GUIDE.md          -- comprehensive guide: modes, interpretation, limitations, troubleshooting
-METHODS_template.md   -- Phase 0-1 deliverable, fill in before coding
-ADVERSARIAL_REVIEW.md -- self-review findings and fixes
 ```
