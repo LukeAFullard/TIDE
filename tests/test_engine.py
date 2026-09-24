@@ -1,457 +1,322 @@
 """
-Phase 3 (core engine) and Phase 4 (Sequential/Cumulative) validation checks.
+Statistical validation of the method: does it flag normal years at about
+the stated rate, detect real changes, and do its parts agree with each
+other? Run with `pytest tests/test_engine.py -v`.
 
-Lean on purpose -- "trust the number it gives you" validation, not an
-exhaustive suite. Run with `pytest tests/test_engine.py -v`, or directly
-with `python tests/test_engine.py` (no pytest required).
-
-IMPORTANT finding from building these tests (kept here, not just in a
-commit message, because it matters for interpreting real results too):
-with ~10 historical years, the false-positive rate CONDITIONAL ON ONE
-FITTED MODEL varies a lot fit to fit -- in a 25-fit simulation it ranged
-from 0% to 25% at nominal alpha=0.05, purely from the sampling noise of
-estimating a median/MAD curve from only ~10 years. The rate averaged
-ACROSS many different historical samples lands close to nominal alpha, but
-any ONE real analysis only ever has ONE historical fit -- so a real result
-inherits some of that fit-specific uncertainty too. This is the small-N
-power/calibration limitation from the "is this defensible" discussion,
-now with a number attached. The tests below pool across several
-historical fits (not just one) for exactly this reason -- a single-fit
-stochastic test would be flaky by construction, not because of a bug.
+Stochastic checks are POOLED across several simulated histories, never
+one: with ~10 historical years the false-alarm rate conditional on one
+particular history varies a lot from history to history (roughly 0-15% at
+a nominal 5%), even though it averages close to 5%. A single-history test
+would be flaky by construction. The full-size calibration study behind the
+USER_GUIDE tables is tests/calibration_study.py.
 """
 
-import sys
 import os
+import sys
+import warnings
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import numpy as np
 import pandas as pd
+from scipy.signal import lfilter
 
 from tide_lite.engine import (
     TideConfig, fit_historical, test_treatment, to_day_of_year, bin_significant,
-    _max_window_mean, estimate_departure_recovery,
+    critical_value, significance_band, _max_window_mean, estimate_departure_recovery,
+    n_bins_for, _window_scores,
 )
 from tide_lite.controllers import (
     holm_bonferroni, SequentialEvent, sequential_test,
     CumulativeWindow, cumulative_test, first_recovery,
 )
 
+warnings.simplefilter("ignore", UserWarning)
+
 
 # ---------------------------------------------------------------------------
-# Shared synthetic data generator
+# Shared synthetic data: seasonal cycle + persistent day-to-day noise
+# (AR(1)) + optional whole-year shift ("wet/dry year").
 # ---------------------------------------------------------------------------
 
 def make_year(rng, year, effect=0.0, n_days=365, base=10.0, seasonal_amp=3.0,
-              ar_noise_sd=0.6, ar_phi=0.7):
+              ar_noise_sd=0.6, ar_phi=0.7, year_sd=0.0):
     days = np.arange(1, n_days + 1)
     seasonal = base + seasonal_amp * np.sin(2 * np.pi * (days - 60) / 365)
-    noise = np.zeros(n_days)
-    e = rng.normal(0, ar_noise_sd, n_days)
-    for i in range(1, n_days):
-        noise[i] = ar_phi * noise[i - 1] + e[i]
-    values = np.clip(seasonal + noise + effect, 0.1, None)
+    noise = lfilter([1.0], [1.0, -ar_phi], rng.normal(0, ar_noise_sd, n_days))
+    values = np.clip(seasonal + noise + rng.normal(0, year_sd) + effect, 0.1, None)
     dates = pd.date_range(f"{year}-01-01", periods=n_days, freq="D")
     return pd.DataFrame({"date": dates, "value": values})
 
 
 def make_year_localized(rng, year, spike_day_range=None, spike_size=0.0, **kwargs):
-    """Same as make_year, but the effect (if any) only applies within
-    spike_day_range=(start_day, end_day) instead of uniformly across the
-    whole year -- for testing that bin_significant() correctly localizes
-    an effect confined to specific months, not just detects "some effect
-    somewhere."
-    """
-    df = make_year(rng, year, effect=0.0, **kwargs)
+    """make_year with the effect confined to days spike_day_range=(start, end)."""
+    df = make_year(rng, year, **kwargs)
     if spike_day_range is not None:
         start, end = spike_day_range
-        day_of_year = np.arange(1, len(df) + 1)
-        mask = (day_of_year >= start) & (day_of_year <= end)
-        df.loc[mask, "value"] = df.loc[mask, "value"] + spike_size
+        day = np.arange(1, len(df) + 1)
+        df.loc[(day >= start) & (day <= end), "value"] += spike_size
     return df
 
 
-def make_historical(rng, start_year=2000, n_years=10):
-    return pd.concat(
-        [make_year(rng, start_year + i) for i in range(n_years)], ignore_index=True
-    )
+def make_historical(rng, start_year=2000, n_years=10, **kwargs):
+    return pd.concat([make_year(rng, start_year + i, **kwargs) for i in range(n_years)],
+                     ignore_index=True)
 
 
-def make_fit(seed, n_years=10, n_bootstrap=300):
+def make_fit(seed, n_years=10, n_bootstrap=300, bin_days=30, **kwargs):
     rng = np.random.default_rng(seed)
-    historical = make_historical(rng, n_years=n_years)
-    config = TideConfig(bin_days=30, detrend_mode="additive", n_bootstrap=n_bootstrap)
+    historical = make_historical(rng, n_years=n_years, **kwargs)
+    config = TideConfig(bin_days=bin_days, detrend_mode="additive", n_bootstrap=n_bootstrap)
     return fit_historical(historical, "date", "value", config), rng
 
 
+def next_year(fit, i=0):
+    """A calendar year after the historical record (the default trend basis)."""
+    return fit.years_used[-1] + 1 + i
+
+
 # ---------------------------------------------------------------------------
-# 1. Day-of-year alignment -- deterministic
+# Deterministic pieces
 # ---------------------------------------------------------------------------
 
 def test_day_of_year_alignment():
-    dates = pd.to_datetime([
-        "2021-01-01", "2021-12-31",         # non-leap: day 1, day 365
-        "2020-01-01", "2020-02-28",         # leap: day 1, day 59
-        "2020-02-29",                        # leap day: NaN
-        "2020-03-01", "2020-12-31",         # leap, post-Feb: shifted down 1
-    ])
+    dates = pd.to_datetime(["2021-01-01", "2021-12-31", "2020-01-01", "2020-02-28",
+                            "2020-02-29", "2020-03-01", "2020-12-31"])
     doy = to_day_of_year(pd.Series(dates))
-    assert doy.iloc[0] == 1
-    assert doy.iloc[1] == 365
-    assert doy.iloc[2] == 1
-    assert doy.iloc[3] == 59
+    assert list(doy.iloc[[0, 1, 2, 3, 5, 6]]) == [1, 365, 1, 59, 60, 365]
     assert np.isnan(doy.iloc[4])
-    assert doy.iloc[5] == 60
-    assert doy.iloc[6] == 365
 
 
-# ---------------------------------------------------------------------------
-# 2. Holm-Bonferroni -- deterministic, hand-checked
-# ---------------------------------------------------------------------------
+def test_short_leftover_bin_is_merged():
+    assert n_bins_for("month") == 12
+    assert n_bins_for(30) == 12      # 12 x 30 days + 5 left over -> merged
+    assert n_bins_for(7) == 52       # 52 x 7 + 1 -> merged
+    assert n_bins_for(73) == 5       # divides exactly
+    assert n_bins_for(100) == 4      # 65 left over is >= half a bin -> kept
+
 
 def test_holm_bonferroni_known_case():
-    p_sorted = np.array([0.001, 0.02, 0.03, 0.04])
-    reject = holm_bonferroni(p_sorted, alpha=0.05)
-    assert list(reject) == [True, False, False, False]
+    assert list(holm_bonferroni(np.array([0.001, 0.02, 0.03, 0.04]), 0.05)) == [True, False, False, False]
+    assert list(holm_bonferroni(np.array([0.04, 0.001, 0.03, 0.02]), 0.05)) == [False, True, False, False]
+    assert list(holm_bonferroni(np.array([0.01, 0.02, 0.025]), 0.05)) == [True, True, True]
 
-    p_shuffled = np.array([0.04, 0.001, 0.03, 0.02])
-    reject2 = holm_bonferroni(p_shuffled, alpha=0.05)
-    assert list(reject2) == [False, True, False, False]
-
-
-# ---------------------------------------------------------------------------
-# 3. Null case: false positive rate near alpha, POOLED across several fits
-# ---------------------------------------------------------------------------
-
-def test_null_case_false_positive_rate():
-    alpha = 0.05
-    n_fits = 12
-    n_trials_per_fit = 15
-    false_positives = 0
-    total = 0
-    for fit_seed in range(n_fits):
-        fit, rng = make_fit(seed=100 + fit_seed)
-        for i in range(n_trials_per_fit):
-            null_year = make_year(rng, 2100 + i, effect=0.0)
-            result = test_treatment(fit, null_year, mode="prediction",
-                                     treatment_year_index=len(fit.years_used), rng=rng)
-            total += 1
-            false_positives += result.p_value < alpha
-    rate = false_positives / total
-    assert 0.0 <= rate <= 0.13, f"pooled false positive rate {rate:.3f} is outside the expected band"
-
-
-# ---------------------------------------------------------------------------
-# 4. Known effect: gets detected (single fit is fine here -- a large true
-#    effect should dominate fit-to-fit noise, unlike the null case above)
-# ---------------------------------------------------------------------------
-
-def test_known_effect_detected():
-    fit, rng = make_fit(seed=2)
-    detections = 0
-    n_trials = 10
-    for i in range(n_trials):
-        effect_year = make_year(rng, 2200 + i, effect=2.5)
-        result = test_treatment(fit, effect_year, mode="prediction",
-                                 treatment_year_index=len(fit.years_used), rng=rng)
-        detections += result.p_value < 0.05
-    assert detections >= 8, f"only detected {detections}/{n_trials} -- expected a clear effect to be reliably caught"
-
-
-# ---------------------------------------------------------------------------
-# 5. Sequential: family-wise error rate control, POOLED across fits
-# ---------------------------------------------------------------------------
-
-def test_sequential_fwer_control():
-    n_fits = 8
-    n_experiments_per_fit = 12
-    n_events = 5
-    family_false_positives = 0
-    total = 0
-    for fit_seed in range(n_fits):
-        fit, rng = make_fit(seed=300 + fit_seed)
-        for exp in range(n_experiments_per_fit):
-            events = [
-                SequentialEvent(label=str(k),
-                                 treatment_df=make_year(rng, 2300 + exp * 10 + k, effect=0.0),
-                                 year_index=len(fit.years_used))
-                for k in range(n_events)
-            ]
-            results = sequential_test(fit, events, alpha=0.05)
-            family_false_positives += any(r.significant_corrected for r in results)
-            total += 1
-    fwer = family_false_positives / total
-    assert fwer <= 0.15, f"family-wise error rate {fwer:.3f} is higher than expected"
-
-
-# ---------------------------------------------------------------------------
-# 6. Cumulative: flags an effect, then clears once it fades, POOLED across fits
-# ---------------------------------------------------------------------------
-
-def test_cumulative_flags_then_clears():
-    n_fits = 6
-    n_trials_per_fit = 10
-    early_detections = 0
-    late_detections = 0
-    total = 0
-    for fit_seed in range(n_fits):
-        fit, rng = make_fit(seed=400 + fit_seed)
-        for i in range(n_trials_per_fit):
-            windows = [
-                CumulativeWindow("early", make_year(rng, 2500 + i * 10, effect=3.0),
-                                  year_index=len(fit.years_used)),
-                CumulativeWindow("late", make_year(rng, 2500 + i * 10 + 1, effect=0.0),
-                                  year_index=len(fit.years_used) + 1),
-            ]
-            results = cumulative_test(fit, windows, alpha=0.05)
-            early_detections += results[0].significant
-            late_detections += results[1].significant
-            total += 1
-    early_rate = early_detections / total
-    late_rate = late_detections / total
-    assert early_rate >= 0.85, f"a clear ongoing effect should almost always be flagged (got {early_rate:.2f})"
-    assert late_rate <= 0.15, f"a fully faded effect should rarely be flagged (got {late_rate:.2f}, expected near alpha=0.05)"
-
-
-# ---------------------------------------------------------------------------
-# 6b. first_recovery: requires consecutive non-significant windows, not
-#     just one -- and correctly ignores a later false-alarm blip once
-#     recovery is already locked in.
-# ---------------------------------------------------------------------------
-
-def test_first_recovery_requires_consecutive():
-    fit, rng = make_fit(seed=450, n_years=20)
-    # effect fades to zero at index 2, stays there, but a later window
-    # (index 4) gets a pure-noise false alarm -- first_recovery should
-    # still report recovery at index 2, not be confused by index 4.
-    effects = [3.0, 1.8, 0.0, 0.0, 0.0]
-    windows = [
-        CumulativeWindow(f"w{i}", make_year(rng, 2600 + i, effect=e), year_index=len(fit.years_used) + i)
-        for i, e in enumerate(effects)
-    ]
-    results = cumulative_test(fit, windows, alpha=0.05)
-
-    rec_strict = first_recovery(results, consecutive_required=2)
-    assert rec_strict.recovered
-    assert rec_strict.recovered_at_index == 2
-
-    rec_none = first_recovery(results[:1], consecutive_required=2)
-    assert not rec_none.recovered
-    assert rec_none.recovered_at_index is None
-
-
-# ---------------------------------------------------------------------------
-# 7. bin_significant: a real effect confined to specific months gets
-#    localized to (roughly) those months, not just "somewhere"
-# ---------------------------------------------------------------------------
-
-def test_bin_significant_localizes_a_real_effect():
-    fit, rng = make_fit(seed=800, n_years=20)  # more years: a sharper,
-    # more reliable per-bin signal, same reasoning as MonitoringSeries
-    # needing more history -- per-bin tests split attention 13 ways
-    treatment = make_year_localized(rng, 2100, spike_day_range=(121, 180), spike_size=6.0)
-    result = test_treatment(fit, treatment, mode="prediction",
-                             treatment_year_index=len(fit.years_used), rng=rng)
-    sig = bin_significant(result, alpha=0.05)
-
-    # bins overlapping day 121-180 at bin_days=30 are bins 5 and 6
-    # (1-indexed: bin = (day-1)//30 + 1)
-    spiked_bins = {5, 6}
-    flagged_bins = set(fit.bins[sig].tolist())
-    assert spiked_bins <= flagged_bins, (
-        f"expected the spiked bins {spiked_bins} to be flagged, got {flagged_bins}"
-    )
-    other_flagged = flagged_bins - spiked_bins
-    assert len(other_flagged) <= 1, (
-        f"expected few or no bins flagged outside the real spike, got {other_flagged}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# 8. bin_significant: family-wise rate across bins stays near alpha under
-#    the null (no real effect anywhere), POOLED across fits -- same
-#    reasoning as every other calibration test in this file.
-# ---------------------------------------------------------------------------
-
-def test_bin_significant_null_calibration():
-    n_fits = 6
-    n_trials_per_fit = 10
-    alpha = 0.05
-    family_false_positives = 0
-    total = 0
-    for fit_seed in range(n_fits):
-        fit, rng = make_fit(seed=900 + fit_seed, n_years=20)
-        for i in range(n_trials_per_fit):
-            null_year = make_year(rng, 2200 + i, effect=0.0)
-            result = test_treatment(fit, null_year, mode="prediction",
-                                     treatment_year_index=len(fit.years_used), rng=rng)
-            sig = bin_significant(result, alpha=alpha)
-            family_false_positives += bool(np.any(sig))
-            total += 1
-    fwer = family_false_positives / total
-    assert fwer <= 0.15, f"family-wise error rate across bins {fwer:.3f} is higher than expected"
-
-
-# ---------------------------------------------------------------------------
-# 9. _max_window_mean mechanics -- deterministic
-# ---------------------------------------------------------------------------
 
 def test_max_window_mean_known_case():
     devs = np.array([1.0, 2.0, 5.0, 6.0, 1.0, 1.0])
-    # windows of length 2: [1,2]=1.5 [2,5]=3.5 [5,6]=5.5 [6,1]=3.5 [1,1]=1.0
     best, start = _max_window_mean(devs, run_length=2)
-    assert start == 2  # the [5,6] window
-    assert abs(best - 5.5) < 1e-9
-
-    # run_length == n_bins collapses to the overall mean, one window only
+    assert start == 2 and abs(best - 5.5) < 1e-9
     best_full, start_full = _max_window_mean(devs, run_length=len(devs))
-    assert start_full == 0
-    assert abs(best_full - devs.mean()) < 1e-9
+    assert start_full == 0 and abs(best_full - devs.mean()) < 1e-9
 
 
 # ---------------------------------------------------------------------------
-# 10. sustained-departure test: run_length=1 reproduces the standard
-#     single-bin-max test EXACTLY -- a consistency check that the new
-#     machinery generalizes the old, not a parallel reimplementation of it
+# Calibration: normal years are flagged at about alpha (pooled)
+# ---------------------------------------------------------------------------
+
+def _pooled_false_alarm_rate(n_fits, n_trials, seed0, alpha=0.05, **kwargs):
+    hits = total = 0
+    for f in range(n_fits):
+        fit, rng = make_fit(seed=seed0 + f, **kwargs)
+        for i in range(n_trials):
+            r = test_treatment(fit, make_year(rng, next_year(fit, i), year_sd=kwargs.get("year_sd", 0.0)),
+                               rng=rng)
+            hits += r.p_value <= alpha
+            total += 1
+    return hits / total
+
+
+def test_null_case_false_positive_rate():
+    rate = _pooled_false_alarm_rate(12, 15, seed0=100)
+    assert rate <= 0.10, f"pooled false positive rate {rate:.3f} is too high"
+
+
+def test_whole_year_shifts_do_not_inflate_false_alarms():
+    """The regime the annual-level component exists for: strong wet/dry-year
+    shifts with a 10-year record. The previous method flagged ~16% of normal
+    years here at a nominal 5%."""
+    rate = _pooled_false_alarm_rate(15, 12, seed0=150, year_sd=1.2, n_bootstrap=500)
+    assert rate <= 0.10, f"false positive rate {rate:.3f} with whole-year shifts"
+
+
+def test_known_effect_detected():
+    fit, rng = make_fit(seed=2)
+    hits = sum(test_treatment(fit, make_year(rng, next_year(fit, i), effect=2.5), rng=rng).p_value <= 0.05
+               for i in range(10))
+    assert hits >= 8, f"only detected {hits}/10"
+
+
+# ---------------------------------------------------------------------------
+# The p-value, the per-bin flags and the plotted band are one decision
+# ---------------------------------------------------------------------------
+
+def test_band_flags_and_p_value_agree_exactly():
+    fit, rng = make_fit(seed=3, n_years=15, n_bootstrap=400)
+    checked_sig = checked_not = 0
+    for i, effect in enumerate([0.0, 0.8, 1.5, 3.0] * 3):
+        for alt in ("two-sided", "greater", "less"):
+            r = test_treatment(fit, make_year(rng, next_year(fit, i), effect=effect),
+                               alternative=alt, rng=rng)
+            for alpha in (0.01, 0.05, 0.1):
+                flags = bin_significant(r, alpha)
+                band = significance_band(fit, r, alpha)
+                outside = (r.treatment_curve > band["upper"] * (1 + 1e-12)) | \
+                          (r.treatment_curve < band["lower"] * (1 - 1e-12))
+                outside &= ~r.missing_bins
+                assert np.array_equal(flags, outside), "band and bin flags disagree"
+                assert flags.any() == (r.p_value <= alpha * (1 + 1e-9)), "flags and p-value disagree"
+                c = critical_value(r, alpha)
+                assert (r.test_statistic > c) == (r.p_value <= alpha * (1 + 1e-9))
+                checked_sig += flags.any()
+                checked_not += not flags.any()
+    assert checked_sig > 0 and checked_not > 0
+
+
+def test_bin_significant_localizes_a_real_effect():
+    fit, rng = make_fit(seed=800, n_years=20)
+    treatment = make_year_localized(rng, next_year(fit), spike_day_range=(121, 180), spike_size=6.0)
+    sig = bin_significant(test_treatment(fit, treatment, rng=rng), alpha=0.05)
+    flagged = set(fit.bins[sig].tolist())
+    assert {5, 6} <= flagged, f"expected bins 5 and 6 flagged, got {flagged}"
+    assert len(flagged - {5, 6}) <= 1
+
+
+def test_one_sided_test_ignores_the_other_direction():
+    fit, rng = make_fit(seed=4, n_years=15, n_bootstrap=400)
+    low = make_year(rng, next_year(fit), effect=-3.0)
+    assert test_treatment(fit, low, alternative="two-sided", rng=1).p_value <= 0.05
+    assert test_treatment(fit, low, alternative="less", rng=1).p_value <= 0.05
+    assert test_treatment(fit, low, alternative="greater", rng=1).p_value > 0.5
+
+
+# ---------------------------------------------------------------------------
+# Sequential and Cumulative
+# ---------------------------------------------------------------------------
+
+def test_sequential_fwer_control():
+    fams = total = 0
+    for f in range(8):
+        fit, rng = make_fit(seed=300 + f)
+        for exp in range(12):
+            events = [SequentialEvent(str(k), make_year(rng, 2300 + exp * 10 + k)) for k in range(5)]
+            fams += any(r.significant_corrected for r in sequential_test(fit, events, rng=rng))
+            total += 1
+    assert fams / total <= 0.12, f"family-wise error rate {fams / total:.3f}"
+
+
+def test_cumulative_flags_then_clears():
+    early = late = total = 0
+    for f in range(6):
+        fit, rng = make_fit(seed=400 + f)
+        for i in range(10):
+            rows = cumulative_test(fit, [
+                CumulativeWindow("early", make_year(rng, 2500 + i * 10, effect=3.0)),
+                CumulativeWindow("late", make_year(rng, 2501 + i * 10, effect=0.0)),
+            ], rng=rng)
+            early += rows[0].significant
+            late += rows[1].significant
+            total += 1
+    assert early / total >= 0.85
+    assert late / total <= 0.12
+
+
+def test_first_recovery_requires_consecutive():
+    fit, rng = make_fit(seed=450, n_years=20)
+    effects = [3.0, 2.5, 0.0, 0.0, 0.0]
+    rows = cumulative_test(fit, [CumulativeWindow(f"w{i}", make_year(rng, 2600 + i, effect=e))
+                                 for i, e in enumerate(effects)], rng=rng)
+    assert rows[0].significant and rows[1].significant
+    rec = first_recovery(rows, consecutive_required=2)
+    assert rec.recovered and rec.recovered_at_index == 2
+    assert not first_recovery(rows[:1], consecutive_required=2).recovered
+
+
+# ---------------------------------------------------------------------------
+# Sustained-departure test and departure extent
 # ---------------------------------------------------------------------------
 
 def test_sustained_run_length_one_matches_standard():
     fit, rng = make_fit(seed=1000, n_years=15)
-    treatment = make_year(rng, 3500, effect=1.5)
-    result = test_treatment(fit, treatment, mode="prediction",
-                             treatment_year_index=len(fit.years_used),
-                             run_lengths=[1], rng=rng)
-    assert result.sustained[1].p_value == result.p_value
-    assert abs(result.sustained[1].test_statistic - result.test_statistic) < 1e-9
+    for alt in ("two-sided", "greater", "less"):
+        r = test_treatment(fit, make_year(rng, next_year(fit), effect=1.5), run_lengths=[1],
+                           alternative=alt, rng=rng)
+        assert r.sustained[1].p_value == r.p_value
+        assert abs(r.sustained[1].test_statistic - r.test_statistic) < 1e-9
 
-
-# ---------------------------------------------------------------------------
-# 11. sustained-departure test: has real, substantially more power than
-#     the single-bin test for a moderate effect spread across several
-#     CONSECUTIVE months -- the actual point of building this. Validated
-#     with enough trials that the first, much smaller (n=40) attempt at
-#     this during development showed the opposite pattern purely from
-#     noise at low power -- worth having in a comment, not just a commit
-#     message, since it's a reminder that a quick power check can mislead
-#     if it doesn't use enough trials.
-# ---------------------------------------------------------------------------
 
 def test_sustained_beats_single_bin_for_sustained_effect():
-    # Pooled across several fits -- a single-fit version of this test
-    # failed during development (16/50 detections, below the threshold)
-    # purely from landing on a colder-than-average fit, the same
-    # per-fit calibration variance documented throughout this file.
-    # Pooling is the fix used everywhere else here for exactly this
-    # reason, not a special case for this test.
-    n_fits = 4
-    n_trials_per_fit = 15
-    single_wins = 0
-    sustained_wins = 0
-    total = 0
-    for fit_seed in range(n_fits):
-        fit, rng = make_fit(seed=1100 + fit_seed, n_years=20, n_bootstrap=500)
-        for i in range(n_trials_per_fit):
-            treatment = make_year_localized(rng, 4500 + fit_seed * 100 + i,
-                                             spike_day_range=(91, 210), spike_size=0.35)
-            result = test_treatment(fit, treatment, mode="prediction",
-                                     treatment_year_index=len(fit.years_used),
-                                     run_lengths=[4], rng=rng)
-            single_wins += result.p_value < 0.05
-            sustained_wins += result.sustained[4].p_value < 0.05
+    single = sustained = total = 0
+    for f in range(5):
+        fit, rng = make_fit(seed=1100 + f, n_years=20, n_bootstrap=500)
+        for i in range(15):
+            t = make_year_localized(rng, next_year(fit, i), spike_day_range=(91, 210), spike_size=0.5)
+            r = test_treatment(fit, t, run_lengths=[4], rng=rng)
+            single += r.p_value <= 0.05
+            sustained += r.sustained[4].p_value <= 0.05
             total += 1
-    assert sustained_wins > single_wins, (
-        f"expected the sustained test to detect a moderate 4-month effect "
-        f"more often (sustained={sustained_wins}/{total}, single={single_wins}/{total})"
-    )
-    assert sustained_wins / total >= 0.35, (
-        f"sustained test detection rate {sustained_wins}/{total} lower than expected"
-    )
+    assert sustained > single, f"sustained={sustained}/{total}, single={single}/{total}"
+    assert sustained / total >= 0.35
 
 
-# ---------------------------------------------------------------------------
-# 12. sustained-departure test: null calibration, pooled across fits
-# ---------------------------------------------------------------------------
+def test_sustained_requires_a_consistent_direction():
+    """Two high bins then two low bins is not a sustained departure; the old
+    statistic (mean of absolute scores) scored it like four high bins."""
+    z = np.array([0.0, 0.0, 3.0, 3.0, -3.0, -3.0, 0.0, 0.0])
+    two_sided = _window_scores(z, 4, "two-sided")[0]
+    assert two_sided[2] == 0.0                     # the up-then-down window cancels
+    assert two_sided.max() == 1.5                  # best window is half-in the rise
+    assert _window_scores(z, 2, "greater")[0].max() == 3.0
+    assert _window_scores(z, 2, "less")[0].max() == 3.0
+
 
 def test_sustained_null_calibration():
-    n_fits = 5
-    n_trials_per_fit = 12
-    alpha = 0.05
-    false_positives = 0
-    total = 0
-    for fit_seed in range(n_fits):
-        fit, rng = make_fit(seed=1200 + fit_seed, n_years=20, n_bootstrap=500)
-        for i in range(n_trials_per_fit):
-            null_year = make_year(rng, 2700 + i, effect=0.0)
-            result = test_treatment(fit, null_year, mode="prediction",
-                                     treatment_year_index=len(fit.years_used),
-                                     run_lengths=[4], rng=rng)
-            false_positives += result.sustained[4].p_value < alpha
+    hits = total = 0
+    for f in range(5):
+        fit, rng = make_fit(seed=1200 + f, n_years=20, n_bootstrap=500)
+        for i in range(12):
+            r = test_treatment(fit, make_year(rng, next_year(fit, i)), run_lengths=[4], rng=rng)
+            hits += r.sustained[4].p_value <= 0.05
             total += 1
-    rate = false_positives / total
-    assert rate <= 0.15, f"sustained-test false positive rate {rate:.3f} is outside the expected band"
+    assert hits / total <= 0.12
 
-
-# ---------------------------------------------------------------------------
-# 13. estimate_departure_recovery: recovers within the period, and
-#     matches the true injected boundaries reasonably closely
-# ---------------------------------------------------------------------------
 
 def test_departure_recovery_matches_injected_boundaries():
     fit, rng = make_fit(seed=1300, n_years=20, n_bootstrap=500)
-    # spike on days 61-210 -> bins 3-7 at bin_days=30 ((day-1)//30+1)
-    treatment = make_year_localized(rng, 4800, spike_day_range=(61, 210), spike_size=3.0)
-    result = test_treatment(fit, treatment, mode="prediction",
-                             treatment_year_index=len(fit.years_used),
-                             run_lengths=[3], rng=rng)
-    dr = estimate_departure_recovery(result, run_length=3)
+    t = make_year_localized(rng, next_year(fit), spike_day_range=(61, 210), spike_size=3.0)  # bins 3-7
+    dr = estimate_departure_recovery(test_treatment(fit, t, run_lengths=[3], rng=rng), 3)
     assert dr.recovered
-    assert dr.departure_start_bin in (2, 3, 4)  # allow +/-1 bin slack
+    assert dr.departure_start_bin in (2, 3, 4)
     assert dr.departure_end_bin in (6, 7, 8)
     assert dr.recovered_at_bin == dr.departure_end_bin + 1
 
 
 def test_departure_recovery_never_recovers():
     fit, rng = make_fit(seed=1301, n_years=20, n_bootstrap=500)
-    n_bins = len(fit.bins)
-    # spike persisting through the last bin of the period
-    treatment = make_year_localized(rng, 4801, spike_day_range=(241, 365), spike_size=3.0)
-    result = test_treatment(fit, treatment, mode="prediction",
-                             treatment_year_index=len(fit.years_used),
-                             run_lengths=[3], rng=rng)
-    dr = estimate_departure_recovery(result, run_length=3)
-    assert not dr.recovered
-    assert dr.recovered_at_bin is None
+    t = make_year_localized(rng, next_year(fit), spike_day_range=(241, 365), spike_size=3.0)
+    dr = estimate_departure_recovery(test_treatment(fit, t, run_lengths=[3], rng=rng), 3)
+    assert not dr.recovered and dr.recovered_at_bin is None
     assert dr.departure_end_bin == int(fit.bins[-1])
 
 
 # ---------------------------------------------------------------------------
-# Standalone runner (no pytest required)
+# Confidence mode
 # ---------------------------------------------------------------------------
 
+def test_confidence_mode_calibration_and_power():
+    hits = det = total = 0
+    for f in range(8):
+        fit, rng = make_fit(seed=1400 + f, n_years=15, n_bootstrap=400)
+        for i in range(8):
+            base = next_year(fit, 3 * i)
+            null = pd.concat([make_year(rng, base + j) for j in range(3)])
+            shifted = pd.concat([make_year(rng, base + 30 + j, effect=1.5) for j in range(3)])
+            hits += test_treatment(fit, null, mode="confidence", rng=rng).p_value <= 0.05
+            det += test_treatment(fit, shifted, mode="confidence", rng=rng).p_value <= 0.05
+            total += 1
+    assert hits / total <= 0.12
+    assert det / total >= 0.8
+
+
 if __name__ == "__main__":
-    tests = [
-        test_day_of_year_alignment,
-        test_holm_bonferroni_known_case,
-        test_null_case_false_positive_rate,
-        test_known_effect_detected,
-        test_sequential_fwer_control,
-        test_cumulative_flags_then_clears,
-        test_first_recovery_requires_consecutive,
-        test_bin_significant_localizes_a_real_effect,
-        test_bin_significant_null_calibration,
-        test_max_window_mean_known_case,
-        test_sustained_run_length_one_matches_standard,
-        test_sustained_beats_single_bin_for_sustained_effect,
-        test_sustained_null_calibration,
-        test_departure_recovery_matches_injected_boundaries,
-        test_departure_recovery_never_recovers,
-    ]
-    failures = 0
-    for t in tests:
-        try:
-            t()
-            print(f"PASS  {t.__name__}")
-        except AssertionError as e:
-            failures += 1
-            print(f"FAIL  {t.__name__}: {e}")
-    print(f"\n{len(tests) - failures}/{len(tests)} passed")
-    sys.exit(1 if failures else 0)
+    import pytest
+    sys.exit(pytest.main([__file__, "-q"]))

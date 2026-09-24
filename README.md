@@ -1,108 +1,100 @@
 # tide_lite
 
-**Did this period's water quality look abnormal compared with your own
-historical "normal" years — accounting for seasonality and
-autocorrelation, without assuming a distribution?**
+**Was this period unusual compared with the site's own normal years?**
 
-One site, one variable, one question. No control site required.
+You have a record of measurements from one site (water quality, air
+quality, flows, anything measured through the year) and a period you want
+to ask about: the year after a discharge started, a restoration, a
+pollution event, or simply this year. tide_lite compares that period with
+the site's own history, allowing for:
+
+- **the seasons**: January is only ever compared with January;
+- **a steady long-term trend**, if the record has one;
+- **ordinary year-to-year variation**, such as wet and dry years;
+
+and it does not assume the data follow a bell curve.
 
 ```python
-from tide_lite import fit_historical, test_treatment
+from tide_lite import fit_historical, test_treatment, summarize, plot_envelope
 
-fit    = fit_historical(historical_df, date_col="date", value_col="value")
-result = test_treatment(fit, treatment_df, rng=42)
+fit    = fit_historical(history_df, date_col="date", value_col="value")
+result = test_treatment(fit, this_year_df, rng=42)      # rng: seed, for reproducibility
 
-print(result.p_value, result.effect_size)
+print(summarize(fit, result))                           # plain-language answer
+plot_envelope(fit, result).figure.savefig("result.png")
 ```
 
-## Four modes, one question each
+`summarize` answers in words: whether the period was outside the normal
+range, which months, by how much, what caveats apply to your data, and the
+exact settings needed to reproduce the result.
 
-| Mode | Question it answers |
+## Is this a compliance test?
+
+It answers **"did this site change from its own normal?"** That is the
+question behind conditions such as "no significant change from baseline"
+or "no more than minor effects". It does **not** check values against a
+fixed limit or guideline; compare with the limit directly for that. Two
+cautions apply to every result:
+
+- **Unusual is not the same as caused by an activity.** Check other
+  explanations (weather, flow, upstream events, changes of method).
+- **"Not significant" means "no change detected", not "no change".** A
+  short or noisy record can only detect large changes; `estimate_power`
+  tells you how large.
+
+## Four ways to use it
+
+| You want to know | Use |
 |---|---|
-| **Standard** (`test_treatment`) | Did this one period behave abnormally? |
-| **Sequential** (`sequential_test`) | Across several separate events, which were real? (Holm-Bonferroni corrected.) |
-| **Cumulative** (`cumulative_test`) | How is this one known event progressing — has it recovered? (Fixed baseline, uncorrected by design.) |
-| **MonitoringSeries** (`MonitoringSeries`) | Is each new year still normal, checked year after year indefinitely, without false-alarm risk piling up? Stateful. Needs ~20+ historical years. |
+| Was this one period unusual? | `test_treatment` |
+| Which of several separate years were unusual? (corrected for testing several) | `sequential_test` |
+| After a known event, is its effect still visible, year by year? | `cumulative_test` + `first_recovery` |
+| Each new year as it arrives, with a fixed false-alarm budget over many years | `MonitoringSeries` (needs 20+ years of history) |
 
-Standard also answers **which months specifically** (`bin_significant`),
-**was it a sustained multi-month shift** (`run_lengths=` →
-`result.sustained`), and **when did it start and did it recover**
-(`estimate_departure_recovery`).
+Also: which months (`bin_significant`), a sustained multi-month departure
+(`run_lengths=[3]`), one-sided questions such as "higher than normal?"
+(`alternative="greater"`), detectable effect size (`estimate_power`), and
+stability under other reasonable settings (`sensitivity_grid`).
 
-Alongside those: `estimate_power` / `estimate_power_sequential` (can this
-test even detect an effect you'd care about, given the history you
-actually have?) and `sensitivity_grid` (is the result stable to
-defensible alternative settings?).
+## How much can you trust it?
 
-## Setup
+Measured by simulation (`tests/calibration_study.py`): with 5–40 years of
+history, the test flagged **3.4%–7.1% of genuinely normal years at a
+stated 5%**. That covers whole-year shifts, trends, skewed data, monthly
+grab samples and part years. Details, assumptions and limitations are in
+`METHODS.md`.
 
-```
-pip install -e .
-```
-
-Four dependencies: numpy, pandas, scipy, matplotlib. Mann-Kendall and
-Sen's slope are implemented directly rather than pulling in another
-package.
-
-## Start here
+## Install and check
 
 ```
-python examples/run_example.py    # full walkthrough on synthetic data, writes four plots
-python -m pytest tests/ -q        # 38 validation and regression checks
+pip install -e .                  # numpy, pandas, scipy, matplotlib
+python examples/run_example.py    # tutorial on synthetic data; writes example plots
+python -m pytest tests/ -q        # 57 checks, about 30 seconds
 ```
 
-**New here? Read `QUICKSTART.md` (5 minutes), then `USER_GUIDE.md`** for
-the complete picture: what each mode is for, how to read a result, how
-much to trust it, and a troubleshooting entry for every error the code
-raises.
+## Documents
 
-`examples/run_example.py` is written as a tutorial — read it top to
-bottom. Swap the synthetic data generator at the top for a real
-`pd.read_csv(...)` and everything downstream is unchanged.
-
-## Two things to know before you interpret a real result
-
-**1. Calibration depends on your data, and the tool tells you which case
-you're in.** Measured false-positive rate at a nominal alpha of 0.05:
-
-| Historical years | Within-year noise only | With whole-year level shifts |
-|---|---|---|
-| 10 | 0.054 | **0.112 – 0.130** |
-| 20 | 0.042 | **0.072 – 0.081** |
-| 40 | 0.018 | — |
-
-When year-to-year variation is just accumulated within-year wiggle, the
-test is well calibrated. When your data also carries genuine whole-year
-level shifts — a wet year sitting high all year, the norm in hydrology —
-it runs at roughly twice its nominal false-positive rate on a 10-year
-record. `fit_historical` reports `between_year_var_frac` so you know
-which row applies, and warns when you're in the bad regime. Full
-explanation, including why the obvious fix doesn't work, in
-`USER_GUIDE.md` § 8 and the `tide_lite/engine.py` docstring.
-
-**2. With ~10 historical years, a single fitted model's false-positive
-rate varies a lot fit to fit** (0–25% at nominal alpha=0.05 in
-simulation) even though it averages out correctly across many possible
-historical samples. Your real analysis only ever has one historical fit.
-This is exactly why `estimate_power` and `sensitivity_grid` exist — run
-them on a real result before leaning on a single p-value.
+| File | For |
+|---|---|
+| `QUICKSTART.md` | A first result in 5 minutes |
+| `USER_GUIDE.md` | Preparing data, choosing settings and modes, reading results, troubleshooting |
+| `METHODS.md` | Every step of the method, its assumptions, measured error rates, references |
+| `CHANGELOG.md` | What changed between versions (re-run results from 0.2.0) |
+| `examples/run_example.py` | Every feature, end to end, on synthetic data |
 
 ## Layout
 
 ```
 tide_lite/
-  engine.py       -- fit_historical, test_treatment (core), plus the
-                     calibration study behind the table above
-  controllers.py  -- Sequential, Cumulative, Holm-Bonferroni
-  power.py        -- power analysis, sensitivity harness
-  monitoring.py   -- MonitoringSeries: ongoing yearly monitoring
-  plotting.py     -- a dedicated plot function per mode
+  engine.py       fit_historical, test_treatment, bins, band, trend tests
+  controllers.py  sequential_test, cumulative_test, first_recovery
+  monitoring.py   MonitoringSeries
+  power.py        estimate_power, sensitivity_grid
+  plotting.py     one plot per mode
+  report.py       summarize
 tests/
-  test_engine.py      -- statistical validation of the method
-  test_monitoring.py  -- MonitoringSeries validation
-  test_regressions.py -- one test per implementation bug found in audit
-examples/
-  run_example.py  -- runnable tutorial, all four modes plotted
-QUICKSTART.md     -- 5-minute start
-USER_GUIDE.md     -- modes, interpretation, calibration, limitations, troubleshooting
+  test_engine.py         statistical behaviour of the method
+  test_regressions.py    one test per implementation defect found in audits
+  test_monitoring.py     MonitoringSeries
+  calibration_study.py   the simulation study behind METHODS.md section 4
 ```

@@ -1,180 +1,136 @@
 """
-TIDE lite -- power analysis and sensitivity harness (Phase 5).
+tide_lite -- power analysis and sensitivity check.
 
-Both tools sit on top of the validated engine (Phase 2-4) and simulate --
-there is no closed-form power formula for this kind of resampling-based
-test, so "can this test even detect an effect I'd care about" has to be
-answered by generating synthetic data with a known injected effect and
-checking the detection rate.
+estimate_power: "could this test detect a change of a given size with the
+history I have?" Answered by simulation: synthetic normal years from the
+fit, with a known shift added, run through the same test.
+
+sensitivity_grid: "does my result hold under other reasonable settings?"
+Re-fits and re-tests with one setting changed at a time.
 """
 
 from __future__ import annotations
 
 from dataclasses import replace
+import warnings
+
 import numpy as np
 import pandas as pd
 
 from .engine import (
     TideFit, TideConfig, fit_historical, test_treatment,
-    _draw_synthetic_residual, _max_standardized_deviation, _resolve_rng,
+    _null_scores, _directional, _resolve_rng, _le, _VALID_ALTERNATIVES,
 )
 
 
-def simulate_synthetic_curve(fit: TideFit, effect_shift: float = 0.0,
-                              n_blocks: int = 1, rng=None) -> np.ndarray:
-    """Draw a synthetic 'what a normal treatment period could look like',
-    optionally with a constant effect injected, using the same
-    position-matched circular block bootstrap as the engine's null
-    distribution.
+def _next_year_index(fit: TideFit) -> float:
+    return float(fit.years_used[-1] - fit.first_year + 1)
 
-    n_blocks: how many independent draws to average (1 = single-year/
-    prediction-style; >1 = confidence-style average of several years).
-    effect_shift is in the same units as fit.median_curve: log-space units
-    if the fit used detrend_mode="log_additive" (roughly a proportional
-    change), otherwise original data units (an absolute change).
-    rng: None (fresh entropy), an int (seed), or a numpy Generator.
-    """
+
+def simulate_synthetic_curve(fit: TideFit, effect_shift: float = 0.0,
+                             n_blocks: int = 1, rng=None) -> np.ndarray:
+    """One synthetic normal period (the average of n_blocks years) from the
+    test's own null, plus a constant shift. Returned in the fit's working
+    units (natural logs if detrend_mode="log_additive"), on the trend level
+    of the first historical year; effect_shift is in the same units."""
     rng = _resolve_rng(rng)
-    n_bins = len(fit.bins)
-    draws = [
-        _draw_synthetic_residual(fit.block_pool, n_bins, fit.block_length_bins, rng)
-        for _ in range(n_blocks)
-    ]
-    residual = np.mean(draws, axis=0)
-    return fit.median_curve + residual + effect_shift
+    idx = [_next_year_index(fit)] * n_blocks
+    z = _null_scores(fit, 1, rng, idx)[0]
+    return fit.median_curve + z * fit.mad + effect_shift
 
 
 def estimate_power(fit: TideFit, effect_sizes, alpha: float = 0.05,
-                    n_simulations: int = 500, n_treatment_years: int = 1,
-                    rng=None) -> dict:
-    """Monte Carlo power curve: detection rate at each candidate effect
-    size. Returns {effect_size: detection_rate}.
+                   n_simulations: int = 500, n_treatment_years: int = 1,
+                   alternative: str = "two-sided", rng=None) -> dict:
+    """Share of simulated periods flagged (p <= alpha) at each effect size.
+    Returns {effect_size: detection_rate}.
 
-    The null distribution doesn't depend on the injected effect, so it's
-    built once (fit.config.n_bootstrap draws) and reused across every
-    effect size and simulation -- this is the expensive part; keep
-    n_simulations modest (a few hundred) unless you have time to spare.
-    rng: None (fresh entropy), an int (seed), or a numpy Generator.
+    effect_sizes are constant shifts in the fit's working units: original
+    units for detrend_mode "additive"/"none"; natural-log units for
+    "log_additive" (0.1 is about +10%). Positive = higher.
 
-    WHAT THIS IS CONDITIONAL ON -- read before quoting a number from it.
-    The simulated "treatment periods" are drawn from the same block pool
-    that builds the null, so this measures power against a year that
-    behaves exactly like a resampled composite of your historical years.
-    A real new year does not: it can carry a whole-year level shift the
-    bootstrap averages away (see engine.py's calibration section), and it
-    is measured against a median/MAD curve estimated from a finite record.
-    Two consequences:
-
-      - power at effect_size=0 comes back at ~alpha BY CONSTRUCTION. That
-        is arithmetic, not evidence that the test is calibrated on your
-        data. Check fit.between_year_var_frac for that.
-      - the detectable effect sizes reported here are the OPTIMISTIC end.
-        Treat a size this curve calls marginal as "not reliably
-        detectable" rather than borderline.
-
-    It is still the right tool for its actual question -- "is the effect I
-    care about anywhere near detectable with the record I have, or am I
-    running a test that cannot answer me?" -- which is usually settled by
-    an order of magnitude, not a few percent.
+    Simulated periods are synthetic normal years from the test's own null
+    plus the shift, so the rate at effect 0 is about alpha by construction
+    (that is not a calibration check; see METHODS.md section 4). Real
+    changes are rarely perfectly uniform, so treat a size this calls
+    marginal as not reliably detectable.
     """
+    if alternative not in _VALID_ALTERNATIVES:
+        raise ValueError(f"alternative must be one of {sorted(_VALID_ALTERNATIVES)}.")
     rng = _resolve_rng(rng)
-    n_bins = len(fit.bins)
-
-    null_stats = np.array([
-        _max_standardized_deviation(
-            np.mean([
-                _draw_synthetic_residual(fit.block_pool, n_bins, fit.block_length_bins, rng)
-                for _ in range(n_treatment_years)
-            ], axis=0) + fit.median_curve,
-            fit.median_curve, fit.mad,
-        )
-        for _ in range(fit.config.n_bootstrap)
-    ])
-    n_ref = len(null_stats)
-
+    idx = [_next_year_index(fit)] * n_treatment_years
+    B = fit.config.n_bootstrap
+    null_max = _directional(_null_scores(fit, B, rng, idx), alternative).max(axis=1)
     power_curve = {}
     for effect in effect_sizes:
-        detections = 0
-        for _ in range(n_simulations):
-            curve = simulate_synthetic_curve(fit, effect_shift=effect,
-                                              n_blocks=n_treatment_years, rng=rng)
-            stat = _max_standardized_deviation(curve, fit.median_curve, fit.mad)
-            p = (np.sum(null_stats >= stat) + 1) / (n_ref + 1)
-            if p < alpha:
-                detections += 1
-        power_curve[float(effect)] = detections / n_simulations
+        z = _null_scores(fit, n_simulations, rng, idx) + effect / fit.mad
+        T = _directional(z, alternative).max(axis=1)
+        p = (np.sum(null_max[None, :] >= T[:, None], axis=1) + 1) / (B + 1)
+        power_curve[float(effect)] = float(np.mean([_le(v, alpha) for v in p]))
     return power_curve
 
 
 def estimate_power_sequential(fit: TideFit, effect_sizes, n_events: int,
-                               alpha: float = 0.05, n_simulations: int = 500,
-                               rng=None) -> dict:
-    """Approximate power for one event within a Sequential set of
-    n_events, using the Bonferroni bound alpha/n_events as the effective
-    per-test alpha. That's the STRICTEST threshold Holm's step-down
-    procedure ever applies, so this UNDERSTATES true Holm power (Holm is
-    uniformly more powerful than plain Bonferroni) -- treat it as a
-    conservative estimate. An exact version would simulate all n_events
-    tests jointly; add that only if the conservative estimate isn't
-    good enough on its own.
-    """
-    effective_alpha = alpha / n_events
-    return estimate_power(fit, effect_sizes, alpha=effective_alpha,
-                           n_simulations=n_simulations, n_treatment_years=1, rng=rng)
+                              alpha: float = 0.05, n_simulations: int = 500,
+                              alternative: str = "two-sided", rng=None) -> dict:
+    """Power for one event in a Sequential set of n_events, using alpha /
+    n_events (the strictest threshold Holm ever applies). Holm is never
+    less powerful than this, so the true power is at least this high."""
+    return estimate_power(fit, effect_sizes, alpha=alpha / n_events,
+                          n_simulations=n_simulations, n_treatment_years=1,
+                          alternative=alternative, rng=rng)
 
 
 def sensitivity_grid(historical_df: pd.DataFrame, treatment_df: pd.DataFrame,
-                      date_col: str, value_col: str, base_config: TideConfig,
-                      variations: dict, mode: str = "prediction",
-                      treatment_year_index: "int | None" = None,
-                      rng=None) -> pd.DataFrame:
-    """Re-fit and re-test under each single-parameter variation (holding
-    everything else at base_config), to check whether a REAL result is
-    stable to defensible alternative choices. A Phase 6 tool -- run once
-    you have a result to stress-test, not for choosing Phase 1 settings.
+                     date_col: str, value_col: str, base_config: TideConfig,
+                     variations: dict, mode: str = "prediction",
+                     alternative: str = "two-sided",
+                     treatment_year_index: "int | None" = None,
+                     rng=None) -> pd.DataFrame:
+    """Re-fit and re-test with one setting changed at a time, e.g.
+    variations={"bin_days": [30, 7], "detrend_mode": ["log_additive"]}.
 
-    variations: {TideConfig field name: [alternative values to try]}
-    e.g. {"bin_days": [7, 30], "detrend_mode": ["additive", "log_additive"]}
+    Every row uses the SAME random seed (rng, if it is an int), so
+    differences between rows come from the setting, not from Monte Carlo
+    noise, and the "base" row reproduces test_treatment(..., rng=rng). A variant that cannot run
+    (e.g. logs of zero values) gets its error message in the "error"
+    column instead of stopping the grid.
 
-    treatment_year_index: passed through to every variant so they are all
-    tested on the same trend basis. Leaving it None is only safe when no
-    variant detects a trend -- otherwise each variant falls back to its own
-    default, and variants that drop a different number of historical years
-    would silently be compared at different points on the trend line.
-
-    rng: seed or Generator, threaded through every variant. Without it the
-    grid mixes real sensitivity to a setting with Monte Carlo noise between
-    runs, which is the one thing this table exists to tell apart.
-
-    One row per variant: p_value, effect_size, test_statistic, and how
-    many historical years survived that variant's completeness filter
-    (watch this -- a variant that quietly drops years isn't a fair
-    comparison). Also n_bins, trend_applied and between_year_var_frac,
-    since a variant can change the answer by changing those rather than by
-    the setting you meant to vary.
+    Watch n_historical_years, n_bins and trend_applied: a variant can change
+    the answer by dropping years or bins rather than through the setting.
     """
-    rng = _resolve_rng(rng)
+    if isinstance(rng, (int, np.integer)) and not isinstance(rng, bool):
+        seed = int(rng)          # base row then matches test_treatment(..., rng=seed)
+    else:
+        seed = int(_resolve_rng(rng).integers(0, 2**32 - 1))
     rows = []
 
-    def _run(cfg: TideConfig, tag: str):
-        fit = fit_historical(historical_df, date_col, value_col, cfg)
-        result = test_treatment(fit, treatment_df, mode=mode,
-                                 treatment_year_index=treatment_year_index, rng=rng)
-        rows.append({
-            "variant": tag, "p_value": result.p_value,
-            "effect_size": result.effect_size,
-            "effect_size_trend_adjusted": result.effect_size_trend_adjusted,
-            "test_statistic": result.test_statistic,
-            "n_historical_years": len(fit.years_used),
-            "n_bins": len(fit.bins),
-            "trend_applied": fit.trend["applied"],
-            "between_year_var_frac": round(fit.between_year_var_frac, 3),
-        })
+    def _run(cfg_kwargs: dict, tag: str):
+        row = {"variant": tag}
+        try:
+            cfg = replace(base_config, **cfg_kwargs)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                fit = fit_historical(historical_df, date_col, value_col, cfg)
+                result = test_treatment(fit, treatment_df, mode=mode, alternative=alternative,
+                                        treatment_year_index=treatment_year_index, rng=seed)
+            row.update({
+                "p_value": result.p_value,
+                "effect_size": result.effect_size,
+                "effect_size_trend_adjusted": result.effect_size_trend_adjusted,
+                "test_statistic": result.test_statistic,
+                "n_historical_years": len(fit.years_used),
+                "n_bins": len(fit.bins),
+                "trend_applied": fit.trend["applied"],
+                "between_year_var_frac": round(fit.between_year_var_frac, 3),
+                "error": "",
+            })
+        except ValueError as e:
+            row["error"] = str(e)
+        rows.append(row)
 
-    _run(base_config, "base")
+    _run({}, "base")
     for field_name, alt_values in variations.items():
         for val in alt_values:
-            cfg = replace(base_config, **{field_name: val})
-            _run(cfg, f"{field_name}={val}")
-
+            _run({field_name: val}, f"{field_name}={val}")
     return pd.DataFrame(rows)

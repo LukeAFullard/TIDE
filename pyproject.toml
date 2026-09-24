@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tide-lite"
-version = "0.2.0"
-description = "Is a treatment period's water quality data unusual relative to historical normal years, accounting for seasonality and autocorrelation, without assuming a distribution?"
+version = "0.3.0"
+description = "Was a period unusual compared with a site's own normal years? A seasonal, trend-aware test for one site and one variable that does not assume a bell curve."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
