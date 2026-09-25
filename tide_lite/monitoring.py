@@ -1,74 +1,30 @@
 """
-TIDE lite -- MonitoringSeries: ongoing, open-ended yearly monitoring.
+tide_lite -- MonitoringSeries: check each new year as it arrives.
 
-Different in kind from Sequential/Cumulative, not just in name. Those two
-take a fixed, fully-known list of events/windows and return all results
-in one call -- a batch operation. This is stateful and incremental: you
-create it once, then call .check() each time a new year's data is ready,
-which in real use happens across separate script runs, months or years
-apart. That's why this is a class with persistence (save/load), not a
-function.
+Stateful: create it once, call .check() each time a new year of data is
+ready (usually a separate script run, once a year), and .save()/.load() in
+between.
 
-Method: fixed horizon, flat alpha split. Commit to a horizon of
-n_years_horizon checks; each one gets alpha_total / n_years_horizon,
-decided in advance. Unlike Holm-Bonferroni (Sequential), no future data
-is needed to know today's threshold -- the flat split is valid the
-instant each check happens. By a union bound over at most
-n_years_horizon checks, the probability of EVER falsely flagging a truly
-normal year across the whole horizon is at most alpha_total *in theory*,
-regardless of dependence between checks -- but see the IMPORTANT note
-below: in practice, with the historical sample sizes common in real
-monitoring, this theoretical guarantee is optimistic. This is the classic
-idea behind group sequential trial spending functions (Pocock 1977;
-O'Brien-Fleming 1979), simplified to a flat, non-adaptive split -- the
-"lite" choice among the three spending strategies discussed for this
-feature: it needs no new machinery beyond a threshold calculation, and
-gives a guarantee you can say out loud ("at most a 5% chance of ever
-falsely flagging across the next 20 years of checks"). It trades away
-some power in later years compared to an open-ended, discovery-adaptive
-scheme (LORD/SAFFRON-style) -- add that only if a real need for
-indefinite, un-plannable-horizon monitoring shows up; it's a materially
-bigger piece of new statistical machinery, not a small extension of
-this one.
+Method: fixed horizon, flat split. Commit in advance to at most
+n_years_horizon checks; each one is tested at alpha_total / n_years_horizon.
+By the union (Bonferroni) bound, the chance of EVER flagging a normal year
+across the whole horizon is at most alpha_total, if each check's p-value
+is accurate at that small threshold. The split is fixed in advance, so no
+future data is needed to know today's threshold.
 
-When the horizon is used up, .check() raises rather than silently
-continuing without a guarantee. Call .renew() to start a fresh horizon --
-a deliberate, visible decision, not an automatic one, since extending a
-monitoring program's guarantee is a real statistical choice.
+The catch is the "if": each check is tested far out in the tail of the
+null distribution (0.0025 for alpha_total=0.05 over 20 years), and a null
+built from N historical years is least accurate there. Measured over a
+10-check horizon with a 5% budget, the chance of ever flagging a normal
+year was up to 15% with 10 years of history and 5-10% with 20-40 years
+(METHODS.md section 4). Use 20+ years and n_bootstrap >= 4000, and treat
+the budget as approximate.
 
-IMPORTANT, found by testing this rather than just deriving it on paper:
-this mode needs MORE historical years than Standard/Sequential/
-Cumulative for its stated guarantee to actually hold. Splitting an
-already-small alpha_total across n_years_horizon checks pushes each
-individual check's threshold deep into the tail of the block-bootstrap
-null distribution -- and bootstrap tail estimates are a well-known weak
-point when the original sample (here, historical years) is small,
-regardless of how many times you resample from it. In simulation
-(fresh, independent synthetic years tested against the real pipeline --
-the same method used throughout this project's own test suite), the
-true "ever flagged falsely across the horizon" rate for a nominal 5%
-budget (n_years_horizon=10) came out to roughly 17% with 10 historical
-years, 7% with 20, and 3% with 30 -- i.e. the stated guarantee is
-genuinely unreliable at the historical sample sizes the other three
-modes tolerate fine.
-
-A tool that lets you check this empirically against your own real
-historical fit (rather than the generic numbers above) was attempted and
-deliberately left out of this version: a leave-one-out design was built,
-and it looked reasonable, but its result pattern (calibration getting
-WORSE with MORE historical years -- backwards) didn't match anything
-else found in this project's testing. Investigating traced it to a real
-structural issue, not a simple bug: holding out one real year at a time
-from a small historical pool and repeating that draw many times (with
-replacement) to build a simulated horizon produces heavy repetition of
-the same held-out year, which understates the true horizon-wide risk --
-worst exactly where the risk is highest. Shipping a self-check tool that
-gives false reassurance in the regime it most needs to warn about would
-be worse than not having one. Revisit this only with a design that
-doesn't share that flaw (e.g. genuinely fresh synthetic data per check,
-not repeated real-year holdouts) -- until then, use the historical-year
-recommendation above directly: 20+ years for reasonable confidence in
-this mode's stated guarantee.
+When the horizon is used up .check() raises; .renew() starts a new horizon
+(a deliberate decision, not an automatic one). The saved state records a
+fingerprint of the fit, and loading it against a different fit raises:
+changing the baseline part-way through would break the pre-committed
+guarantee.
 """
 
 from __future__ import annotations
@@ -78,73 +34,63 @@ import json
 import warnings
 
 import numpy as np
+import pandas as pd
 
-from .engine import TideFit, test_treatment
+from .engine import TideFit, test_treatment, _le, _VALID_ALTERNATIVES
 
 
 @dataclass
 class MonitoringCheck:
     check_number: int
     label: str
-    year_index: "int | None"
+    year_index: "float | None"
     alpha_used: float
     p_value: float
     effect_size: float
     effect_size_trend_adjusted: float
     flagged: bool
+    calendar_year: "int | None" = None
 
 
 class MonitoringSeries:
     def __init__(self, fit: TideFit, alpha_total: float = 0.05,
-                 n_years_horizon: int = 20):
+                 n_years_horizon: int = 20, alternative: str = "two-sided"):
         if not 0 < alpha_total < 1:
-            raise ValueError(
-                f"alpha_total must be strictly between 0 and 1, got {alpha_total}."
-            )
+            raise ValueError(f"alpha_total must be strictly between 0 and 1, got {alpha_total}.")
         if n_years_horizon < 1:
-            raise ValueError(
-                f"n_years_horizon must be >= 1, got {n_years_horizon}."
-            )
+            raise ValueError(f"n_years_horizon must be >= 1, got {n_years_horizon}.")
+        if alternative not in _VALID_ALTERNATIVES:
+            raise ValueError(f"alternative must be one of {sorted(_VALID_ALTERNATIVES)}.")
         self.fit = fit
         self.alpha_total = alpha_total
         self.n_years_horizon = n_years_horizon
-        self.checks: list[MonitoringCheck] = []
+        self.alternative = alternative
+        self.checks: "list[MonitoringCheck]" = []
 
-        # Splitting the budget across a long horizon can push the per-check
-        # threshold below the finest p-value the bootstrap can resolve
-        # (1 / (n_bootstrap + 1)). Past that point .check() cannot flag
-        # ANYTHING, at any effect size -- and would have gone on returning
-        # a confident-looking flagged=False forever.
         min_p = 1.0 / (fit.config.n_bootstrap + 1)
-        if min_p >= self.alpha_per_check:
-            needed = int(np.ceil(1.0 / self.alpha_per_check))
+        if not _le(min_p, self.alpha_per_check):
             raise ValueError(
-                f"This horizon cannot flag anything. alpha_total="
-                f"{alpha_total} split across {n_years_horizon} checks gives "
-                f"alpha_per_check={self.alpha_per_check:.6f}, but "
-                f"{fit.config.n_bootstrap} bootstrap draws can never produce a "
-                f"p-value below {min_p:.6f}. Refit with "
-                f"TideConfig(n_bootstrap>={needed}), shorten n_years_horizon, "
-                f"or raise alpha_total."
+                f"This horizon cannot flag anything: alpha_per_check="
+                f"{self.alpha_per_check:.6f} is below the smallest p-value "
+                f"{fit.config.n_bootstrap} bootstrap draws can produce ({min_p:.6f}). "
+                f"Refit with TideConfig(n_bootstrap>={int(np.ceil(10 / self.alpha_per_check))}), "
+                f"shorten n_years_horizon, or raise alpha_total."
             )
         if min_p > self.alpha_per_check / 10:
             warnings.warn(
-                f"alpha_per_check={self.alpha_per_check:.6f} is close to the "
-                f"finest p-value {fit.config.n_bootstrap} bootstrap draws can "
-                f"resolve ({min_p:.6f}), so a flag depends on a handful of "
-                f"extreme draws. Raise n_bootstrap to at least "
-                f"{int(np.ceil(10.0 / self.alpha_per_check))} for a stable "
-                f"threshold.",
+                f"alpha_per_check={self.alpha_per_check:.6f} rests on fewer than 10 "
+                f"of the {fit.config.n_bootstrap} bootstrap draws. Refit with "
+                f"n_bootstrap >= {int(np.ceil(10 / self.alpha_per_check))} for a stable threshold.",
                 UserWarning, stacklevel=2,
             )
         if len(fit.years_used) < 20:
             warnings.warn(
-                f"MonitoringSeries is fitted on {len(fit.years_used)} historical "
-                f"years. Its stated budget needs ~20+ to hold: in simulation a "
-                f"nominal 5% lifetime budget ran at ~17% true false-alarm rate "
-                f"with 10 historical years, 7% with 20, 3% with 30. Treat "
-                f"flags from a shorter record as indicative, not as a 5% "
-                f"guarantee -- see the module docstring.",
+                f"MonitoringSeries is fitted on {len(fit.years_used)} historical years. "
+                f"Its per-check threshold ({self.alpha_per_check:.4f}) is far into the "
+                f"tail of the null, which a short record cannot pin down: in simulation "
+                f"a 5% budget over 10 checks ran at up to 15% with 10 years of history "
+                f"(up to about 10% with 20-40). Use 20+ years and treat the budget as "
+                f"approximate (METHODS.md section 4).",
                 UserWarning, stacklevel=2,
             )
 
@@ -156,77 +102,76 @@ class MonitoringSeries:
     def remaining(self) -> int:
         return self.n_years_horizon - len(self.checks)
 
-    def check(self, treatment_df, label: "str | None" = None,
+    def check(self, treatment_df: pd.DataFrame, label: "str | None" = None,
               year_index: "int | None" = None, rng=None) -> MonitoringCheck:
-        """Test one new year against the historical fit, using this
-        horizon's flat alpha allocation. Raises if the horizon is used up
-        (call .renew()) or if the fit has an applied trend correction and
-        year_index wasn't given (checks aren't assumed adjacent in time,
-        same reasoning as Sequential/Cumulative).
-        """
+        """Test one new calendar year at alpha_per_check and log it. Pass
+        rng=<int> to make the logged p-value reproducible."""
         if self.remaining <= 0:
             raise ValueError(
-                f"Monitoring horizon of {self.n_years_horizon} checks is "
-                f"used up. Call .renew(...) to start a fresh horizon with "
-                f"a new budget -- this is deliberately not automatic, "
-                f"since it's a real statistical decision, not a formality."
+                f"The monitoring horizon of {self.n_years_horizon} checks is used up. "
+                f"Call .renew() to start a new horizon; this is deliberately not automatic."
             )
-        if self.fit.trend["applied"] and year_index is None:
-            raise ValueError(
-                "The historical fit has an applied trend correction, so "
-                "each check needs an explicit year_index -- monitoring "
-                "checks aren't assumed to be adjacent in time relative to "
-                "the historical fit, the same reasoning as Sequential and "
-                "Cumulative."
-            )
-        check_number = len(self.checks) + 1
+        years = sorted(set(pd.to_datetime(treatment_df[self.fit.date_col]).dt.year.dropna().astype(int)))
+        done = {c.calendar_year for c in self.checks if c.calendar_year is not None}
+        repeated = sorted(set(years) & done)
+        if repeated:
+            raise ValueError(f"Year(s) {repeated} have already been checked in this horizon.")
         result = test_treatment(self.fit, treatment_df, mode="prediction",
-                                 treatment_year_index=year_index, rng=rng)
+                                treatment_year_index=year_index,
+                                alternative=self.alternative, rng=rng)
+        number = len(self.checks) + 1
         record = MonitoringCheck(
-            check_number=check_number,
-            label=label or f"check {check_number}",
-            year_index=year_index,
+            check_number=number,
+            label=label or str(result.treatment_years[0]),
+            year_index=result.treatment_year_index,
             alpha_used=self.alpha_per_check,
             p_value=result.p_value,
             effect_size=result.effect_size,
             effect_size_trend_adjusted=result.effect_size_trend_adjusted,
-            flagged=bool(result.p_value < self.alpha_per_check),
+            flagged=_le(result.p_value, self.alpha_per_check),
+            calendar_year=int(result.treatment_years[0]),
         )
         self.checks.append(record)
         return record
 
     def renew(self, alpha_total: "float | None" = None,
               n_years_horizon: "int | None" = None) -> "MonitoringSeries":
-        """Start a fresh monitoring horizon with a new budget. Returns a
-        NEW MonitoringSeries with an empty check log -- renewal is a real
-        statistical decision (a fresh guarantee starting now), so it's
-        explicit and doesn't carry check history into the new budget's
-        bookkeeping. Read/save .checks first (or keep a reference to this
-        object) if you want the prior horizon's record.
-        """
+        """A NEW series with a fresh budget and an empty log. Save or keep
+        this one first if you need the previous horizon's record."""
         return MonitoringSeries(
             fit=self.fit,
-            alpha_total=alpha_total if alpha_total is not None else self.alpha_total,
-            n_years_horizon=n_years_horizon if n_years_horizon is not None else self.n_years_horizon,
+            alpha_total=self.alpha_total if alpha_total is None else alpha_total,
+            n_years_horizon=self.n_years_horizon if n_years_horizon is None else n_years_horizon,
+            alternative=self.alternative,
         )
 
     def to_dict(self) -> dict:
-        """Only the lightweight state -- budget and check history, all
-        JSON-safe scalars. Does NOT include the fit itself (a TideFit
-        holds numpy arrays and is expected to be re-created fresh each
-        session via fit_historical on your historical data, or persisted
-        separately by your own method if you want to skip re-fitting).
-        """
+        """Budget, check log and the fit's fingerprint (not the fit itself:
+        re-create it each session with fit_historical on the same data and
+        settings)."""
         return {
             "alpha_total": self.alpha_total,
             "n_years_horizon": self.n_years_horizon,
+            "alternative": self.alternative,
+            "fit_fingerprint": self.fit.fingerprint(),
             "checks": [asdict(c) for c in self.checks],
         }
 
     @classmethod
     def from_dict(cls, fit: TideFit, d: dict) -> "MonitoringSeries":
+        saved = d.get("fit_fingerprint")
+        if saved is not None and saved != fit.fingerprint():
+            raise ValueError(
+                "This monitoring state was created with a different historical fit "
+                "(different data, years or settings). Re-create the fit exactly as "
+                "before (same historical data and TideConfig), or start a new series."
+            )
+        if saved is None:
+            warnings.warn("Saved state has no fit fingerprint (older version); "
+                          "cannot confirm the fit is unchanged.", UserWarning, stacklevel=2)
         series = cls(fit=fit, alpha_total=d["alpha_total"],
-                     n_years_horizon=d["n_years_horizon"])
+                     n_years_horizon=d["n_years_horizon"],
+                     alternative=d.get("alternative", "two-sided"))
         series.checks = [MonitoringCheck(**c) for c in d["checks"]]
         return series
 
@@ -236,8 +181,6 @@ class MonitoringSeries:
 
     @classmethod
     def load(cls, fit: TideFit, path: str) -> "MonitoringSeries":
-        """fit must be supplied fresh (re-run fit_historical on your
-        historical data) -- see to_dict()."""
+        """fit must be re-created with the same data and settings; see to_dict()."""
         with open(path) as f:
-            d = json.load(f)
-        return cls.from_dict(fit, d)
+            return cls.from_dict(fit, json.load(f))

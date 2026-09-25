@@ -1,36 +1,41 @@
 {
   "alpha_total": 0.05,
   "n_years_horizon": 10,
+  "alternative": "two-sided",
+  "fit_fingerprint": "5c4d7e515a4e4380",
   "checks": [
     {
       "check_number": 1,
       "label": "2020",
-      "year_index": 10,
+      "year_index": 20.0,
       "alpha_used": 0.005,
-      "p_value": 0.3543228385807096,
-      "effect_size": 0.21576169378796184,
-      "effect_size_trend_adjusted": 0.21576169378796184,
-      "flagged": false
+      "p_value": 0.08297925518620344,
+      "effect_size": 0.5712570508846961,
+      "effect_size_trend_adjusted": 0.5712570508846961,
+      "flagged": false,
+      "calendar_year": 2020
     },
     {
       "check_number": 2,
       "label": "2021",
-      "year_index": 11,
+      "year_index": 21.0,
       "alpha_used": 0.005,
-      "p_value": 0.22188905547226387,
-      "effect_size": 0.1613780504809359,
-      "effect_size_trend_adjusted": 0.1613780504809359,
-      "flagged": false
+      "p_value": 0.3686578355411147,
+      "effect_size": -0.03491786682328257,
+      "effect_size_trend_adjusted": -0.03491786682328257,
+      "flagged": false,
+      "calendar_year": 2021
     },
     {
       "check_number": 3,
       "label": "2022",
-      "year_index": 12,
+      "year_index": 22.0,
       "alpha_used": 0.005,
-      "p_value": 0.0004997501249375312,
-      "effect_size": 2.876049969428289,
-      "effect_size_trend_adjusted": 2.876049969428289,
-      "flagged": true
+      "p_value": 0.00024993751562109475,
+      "effect_size": 3.1826500374775315,
+      "effect_size_trend_adjusted": 3.1826500374775315,
+      "flagged": true,
+      "calendar_year": 2022
     }
   ]
 }
