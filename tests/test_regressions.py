@@ -365,6 +365,26 @@ def test_monitoring_refuses_a_different_fit_on_reload(tmp_path):
         series.check(make_year(rng, next_year(fit)), rng=2)
 
 
+def test_monitoring_state_from_0_3_explains_how_to_continue(tmp_path):
+    """0.3.0 state (no version, fitted with its default pool_window_radius=1)
+    was refused with 'same data and TideConfig', which the user HAD used:
+    only the default had changed, and the message did not say so."""
+    rng = np.random.default_rng(30)
+    hist = pd.concat([make_year(rng, 2000 + i) for i in range(20)], ignore_index=True)
+    old_fit = fit_historical(hist, "date", "value", TideConfig(n_bootstrap=2000, pool_window_radius=1))
+    series = MonitoringSeries(old_fit, alpha_total=0.05, n_years_horizon=5)
+    series.check(make_year(rng, 2020), rng=1)
+    state = series.to_dict()
+    assert state["tide_lite_version"]
+    del state["tide_lite_version"]                     # as 0.3.0 saved it
+    path = tmp_path / "state.json"
+    path.write_text(__import__("json").dumps(state))
+    new_fit = fit_historical(hist, "date", "value", TideConfig(n_bootstrap=2000))
+    with pytest.raises(ValueError, match=r"refit with TideConfig\(\.\.\., pool_window_radius=1\)"):
+        MonitoringSeries.load(new_fit, str(path))
+    assert len(MonitoringSeries.load(old_fit, str(path)).checks) == 1
+
+
 # ---------------------------------------------------------------------------
 # Diagnostics, departure extent, plotting, report
 # ---------------------------------------------------------------------------
