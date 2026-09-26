@@ -4,9 +4,12 @@
 
 A further independent audit re-ran the calibration study and tested each
 part of the method separately. **Re-run results produced with 0.3.0**:
-p-values change slightly, and saved `MonitoringSeries` state from 0.3.0
-will not load against a 0.4.0 fit (the fingerprint includes the changed
-default). Measured false-alarm rates at a stated 5% went from 3.4%–7.1%
+p-values change slightly. Saved `MonitoringSeries` state from 0.3.0
+will not load against a fit with the new default: to continue that
+horizon exactly as committed, refit with `TideConfig(...,
+pool_window_radius=1)`; otherwise keep the old file as the record of the
+checks so far and start a new series. The error message says so, and
+saved state now records the tide_lite version. Measured false-alarm rates at a stated 5% went from 3.4%–7.1%
 (0.3.0) to 2.6%–6.6%; at a stated 1%, from up to 4.2% to up to 3.3%;
 three years averaged (`mode="confidence"`), from 7.5%–8.3% to 4.2%–5.8%.
 

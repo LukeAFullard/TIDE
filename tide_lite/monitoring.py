@@ -52,6 +52,14 @@ class MonitoringCheck:
     calendar_year: "int | None" = None
 
 
+def _before_0_4(version) -> bool:
+    """True for state saved before 0.4.0 (which did not record a version)."""
+    if version is None:
+        return True
+    major, minor = (int(x) for x in str(version).split(".")[:2])
+    return (major, minor) < (0, 4)
+
+
 class MonitoringSeries:
     def __init__(self, fit: TideFit, alpha_total: float = 0.05,
                  n_years_horizon: int = 20, alternative: str = "two-sided"):
@@ -149,7 +157,9 @@ class MonitoringSeries:
         """Budget, check log and the fit's fingerprint (not the fit itself:
         re-create it each session with fit_historical on the same data and
         settings)."""
+        from . import __version__
         return {
+            "tide_lite_version": __version__,
             "alpha_total": self.alpha_total,
             "n_years_horizon": self.n_years_horizon,
             "alternative": self.alternative,
@@ -161,11 +171,18 @@ class MonitoringSeries:
     def from_dict(cls, fit: TideFit, d: dict) -> "MonitoringSeries":
         saved = d.get("fit_fingerprint")
         if saved is not None and saved != fit.fingerprint():
-            raise ValueError(
-                "This monitoring state was created with a different historical fit "
-                "(different data, years or settings). Re-create the fit exactly as "
-                "before (same historical data and TideConfig), or start a new series."
-            )
+            msg = ("This monitoring state was created with a different historical fit "
+                   "(different data, years or settings). Re-create the fit exactly as "
+                   "before (same historical data and TideConfig), or start a new series.")
+            if _before_0_4(d.get("tide_lite_version")) and fit.config.pool_window_radius == 0:
+                msg += (" This state was saved by tide_lite "
+                        f"{d.get('tide_lite_version') or '0.3.0 or earlier'}, whose default was "
+                        "pool_window_radius=1 (0.4.0 changed it to 0; see CHANGELOG.md). "
+                        "To continue this horizon exactly as committed, refit with "
+                        "TideConfig(..., pool_window_radius=1). Or keep this file as the "
+                        "record of the checks so far and start a new MonitoringSeries on a "
+                        "0.4.0 fit. Either way, state which you did in the report.")
+            raise ValueError(msg)
         if saved is None:
             warnings.warn("Saved state has no fit fingerprint (older version); "
                           "cannot confirm the fit is unchanged.", UserWarning, stacklevel=2)

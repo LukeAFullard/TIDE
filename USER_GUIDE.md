@@ -332,7 +332,7 @@ flagged, and the months flagged are exactly those outside the band in
 | `This horizon cannot flag anything` | `alpha_total / n_years_horizon` is below the smallest possible p-value. Raise `n_bootstrap` as suggested. |
 | `The monitoring horizon of N checks is used up` | Call `.renew()`. |
 | `Year(s) ... have already been checked` | Each year is checked once per horizon. |
-| `This monitoring state was created with a different historical fit` | Re-create the fit with exactly the same history and `TideConfig` as before. |
+| `This monitoring state was created with a different historical fit` | Re-create the fit with exactly the same history and `TideConfig` as before. For a file saved by 0.3.0 or earlier, also pass `pool_window_radius=1` (the old default), or start a new series. |
 | `consecutive_required must be >= 1` | Use 2 or more. |
 | `... must be one of ...` / `... must be between ...` | A misspelled or impossible setting. |
 
