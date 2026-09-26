@@ -101,18 +101,28 @@ fit = fit_historical(history, "date", "value", config)
 | Setting | Default | Change it when |
 |---|---|---|
 | `bin_days` | `"month"` | You have frequent data and care about weekly detail (`7`). |
-| `detrend_mode` | `"additive"` | Values are positive and changes are naturally proportional (concentrations that vary by factors): `"log_additive"`. Use `"none"` to never remove a trend. |
+| `detrend_mode` | `"additive"` | Values are positive and changes are naturally proportional (concentrations that vary by factors): `"log_additive"`. Use `"none"` to never remove a trend (see below). |
 | `n_bootstrap` | `2000` | Use 4000+ for `MonitoringSeries`, or for reporting p-values below 0.01. |
 | `max_missing_frac` | `0.5` | Rarely. Raising it admits sparser years. |
 | `min_bin_coverage` | `0.75` | Rarely. |
 | `mk_alpha` | `0.10` | Rarely. The trend is removed if Mann-Kendall p is below this. |
+
+**Should a trend be removed?** By default, if the history shows a steady
+rise or fall, it is removed and projected to the tested year, so a year
+that just continues the trend counts as normal. That suits "was this year
+unusual given how the site was already changing?". If your question is
+"has the site changed from its historical level?", a continuing
+deterioration *is* the change you are looking for: use
+`detrend_mode="none"`. Decide which question you are asking before you
+look. The further the tested year is from the end of the history, the
+more a removed trend matters; you get a warning beyond 5 years.
 
 And for each test:
 
 | Argument | Default | Meaning |
 |---|---|---|
 | `alternative` | `"two-sided"` | `"greater"` if only an increase matters (e.g. "did concentrations rise?"); `"less"` for decreases. More sensitive in that direction, blind to the other. Decide in advance. |
-| alpha (in `summarize`, `bin_significant`, plots, controllers) | `0.05` | The false-alarm rate you accept. 0.05 or 0.10 are well calibrated; at 0.01 the real rate can be up to about 4% (`METHODS.md` section 4). |
+| alpha (in `summarize`, `bin_significant`, plots, controllers) | `0.05` | The false-alarm rate you accept. 0.05 or 0.10 are well calibrated; at 0.01 the real rate can be up to about 3% (`METHODS.md` section 4). |
 | `rng` | none | **Always pass a number** (e.g. `rng=42`) for a result you report. |
 
 ## 4. Which mode?
@@ -157,8 +167,7 @@ print(fit.bins[bin_significant(result, alpha=0.05)])     # months flagged
 
 To test the **average of several years** (e.g. "were 2021–2023 as a
 whole unusual?"): `test_treatment(fit, df_2021_to_2023, mode="confidence", rng=42)`.
-A month missing in any of those years is left out. Measured false-alarm
-rate is slightly high in this mode (7–8% at a stated 5%).
+A month missing in any of those years is left out.
 
 **Sustained departure.** "Was there a run of 3 months that was
 consistently high (or low)?":
@@ -289,8 +298,8 @@ flagged, and the months flagged are exactly those outside the band in
    change of site, method, laboratory or units within them.
 4. `years_dropped`, `bins_dropped` and any warnings were read and are
    acceptable.
-5. If a trend was removed, it is plausible, and `effect_size_trend_adjusted`
-   is the number quoted.
+5. If a trend was removed, it is plausible, removing it fits the question
+   (section 3), and `effect_size_trend_adjusted` is the number quoted.
 6. The plot agrees with the answer (it must, by construction; if it
    seems not to, check you are looking at the right alpha).
 7. For a NO: `estimate_power` shows what size of change could have been
@@ -339,6 +348,8 @@ flagged, and the months flagged are exactly those outside the band in
 | `treatment_year_index=... but the data is dated ...` | You overrode the year; check this was intended. |
 | `Nothing can be flagged at alpha=...` | `n_bootstrap` too small for that alpha. |
 | `The bin after the departure ... has no treatment data` | "Recovered" only means the departure stopped being visible. |
+| `N treatment bin(s) have more than twice the usual number of measurements` | The tested period was sampled far more often than the history (e.g. a sensor against monthly grab samples). Test a subset that matches the historical frequency. |
+| `The historical trend is projected N years beyond the historical record` | The answer depends on a trend projected far forward. Also run with `detrend_mode="none"` and report both. |
 | `MonitoringSeries is fitted on N historical years` / `alpha_per_check ... rests on fewer than 10` | Use 20+ years and a larger `n_bootstrap`. |
 
 **Two runs give different p-values.** Pass `rng=` with a fixed number.

@@ -41,17 +41,19 @@ result = test_treatment(fit, treatment, rng=42)
 print(summarize(fit, result))
 ```
 
-Example output:
+Example output (from `examples/run_example.py`, whose 2021 has a real change):
 
 ```
-Question: were 2024 values higher or lower than the site's normal range (20 historical years, 2004-2023)?
-Answer: YES at alpha=0.05 (p = 0.0015; at most alpha).
+Question: were 2021 values higher or lower than the site's normal range (20 historical years, 2000-2019)?
+Answer: YES: the period was outside the site's normal range at alpha=0.05 (p = 0.003999; at most alpha).
 Bins outside the normal range: Mar, Sep, Oct, Dec.
 Typical difference from the historical level: +1.637 (units of 'value'; median over 12 tested bins).
 Notes: ...
-Reproduce with: tide_lite 0.3.0; TideConfig(...); rng=42; fit fingerprint 5c4d7e515a4e4380.
+Reproduce with: tide_lite 0.4.0; TideConfig(...); mode='prediction', alternative='two-sided', rng=42; fit fingerprint 24374d023689133c.
 ```
 
+- **Answer**: YES means the period was unusual for this site. NO means
+  no unusual departure was detected; it does not prove nothing changed.
 - **p-value**: how often a normal year would look at least this unusual.
   At or below 0.05 is the usual bar for "unusual".
 - **Bins**: the months that fell outside the normal range.

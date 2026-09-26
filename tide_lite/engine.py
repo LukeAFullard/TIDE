@@ -35,11 +35,11 @@ plain-language version; keep the two in step):
     a within-year pattern (the rest, divided by the leave-one-out spread).
  8. Null distribution. Each synthetic normal year = a within-year pattern
     stitched together from blocks of consecutive bins taken from historical
-    years (a block always comes from the same time of year, +/-
-    pool_window_radius bins; the block seams fall at a random place) + one
-    annual level drawn from a Student-t prediction distribution fitted to
-    the historical annual levels, divided by each bin's spread. n_bootstrap
-    synthetic years are drawn.
+    years (a block always comes from exactly the same bins of the year, so
+    every month is represented once; the block seams fall at a random
+    place) + one annual level drawn from a Student-t prediction
+    distribution fitted to the historical annual levels, divided by each
+    bin's spread. n_bootstrap synthetic years are drawn.
  9. The treatment period is scored against the step-5 baseline, with the
     step-4 trend extrapolated to its own calendar year.
 10. Test statistic: the largest bin score (largest absolute score for a
@@ -70,7 +70,11 @@ simulation study is in tests/calibration_study.py):
 - Sub-year blocks (step 8). Resampling whole years gives only N possible
   synthetic years, so the smallest attainable p-value would be 1/(N+1)
   (0.09 for N=10). Blocks of consecutive bins keep the within-year
-  persistence (autocorrelation) that independent bins would destroy.
+  persistence (autocorrelation) that independent bins would destroy. A
+  block is taken from the same bins it fills (pool_window_radius=0):
+  borrowing from neighbouring bins could not reach past January or
+  December, so those months were under-represented in the null and false
+  alarms rose in every simulated condition.
 - Max statistic + single-step max-T (steps 10-11). One number for the whole
   period, with no multiple-comparisons inflation across bins, and it makes
   the per-bin flags and the plot agree with the p-value by construction.
@@ -264,8 +268,11 @@ class TideConfig:
                                      # with a 30-day one)
     n_bootstrap: int = 2000          # synthetic normal years in the null
     block_length_bins: "int | None" = None  # None = auto: max(2, n_bins // 4)
-    pool_window_radius: int = 1      # blocks may come from +/- this many bins
-                                     # away from the slot they fill
+    pool_window_radius: int = 0      # blocks may come from +/- this many bins
+                                     # away from the slot they fill. Keep 0:
+                                     # with 1, the first and last bins of the
+                                     # year were under-represented in the null
+                                     # (0.6x) and false alarms rose
 
     def __post_init__(self):
         """Reject misspelled or impossible settings loudly rather than
@@ -723,10 +730,13 @@ def _directional(z: np.ndarray, alternative: str) -> np.ndarray:
     return z if alternative == "greater" else -z
 
 
-def _window_scores(z: np.ndarray, run_length: int, alternative: str) -> np.ndarray:
+def _window_scores(z: np.ndarray, run_length: int, alternative: str,
+                   bins: "np.ndarray | None" = None) -> np.ndarray:
     """Directional score of every run of run_length consecutive bins (the
     mean score, then |.| for two-sided). Works on 1-D or (draws, bins);
-    windows touching a NaN come back as -inf so they never win a max."""
+    windows touching a NaN come back as -inf so they never win a max, and
+    so do windows that jump over a bin dropped from the fit (given `bins`,
+    the bin labels): those bins are not consecutive."""
     z = np.atleast_2d(z)
     n = z.shape[1]
     if run_length < 1:
@@ -735,7 +745,12 @@ def _window_scores(z: np.ndarray, run_length: int, alternative: str) -> np.ndarr
         raise ValueError(f"run_length ({run_length}) exceeds the number of bins ({n}).")
     means = np.lib.stride_tricks.sliding_window_view(z, run_length, axis=1).mean(axis=-1)
     scores = _directional(means, alternative)
-    return np.where(np.isnan(scores), -np.inf, scores)
+    scores = np.where(np.isnan(scores), -np.inf, scores)
+    if bins is not None:
+        b = np.asarray(bins)
+        gap = (b[run_length - 1:] - b[:n - run_length + 1]) != run_length - 1
+        scores[:, gap] = -np.inf
+    return scores
 
 
 def _max_window_mean(values: np.ndarray, run_length: int) -> tuple[float, int]:
@@ -800,6 +815,16 @@ def test_treatment(fit: TideFit, treatment_df: pd.DataFrame,
                 f"usual number of measurements and are treated as missing.",
                 UserWarning, stacklevel=2,
             )
+        n_dense = int((counts > 2 * fit.typical_counts).to_numpy().sum())
+        if n_dense:
+            warnings.warn(
+                f"{n_dense} treatment bin(s) have more than twice the usual number of "
+                f"measurements (e.g. continuous sensor data tested against a history of "
+                f"grab samples). Their summaries vary less than the historical ones, so "
+                f"the comparison is not like for like. Consider using only a subset of "
+                f"the tested data that matches the historical sampling frequency.",
+                UserWarning, stacklevel=2,
+            )
     pivot = pivot.dropna(how="all")
     if len(pivot) == 0:
         raise ValueError(
@@ -837,6 +862,19 @@ def test_treatment(fit: TideFit, treatment_df: pd.DataFrame,
     else:
         year_indices = [float(y - fit.first_year) for y in years]
     x0 = float(np.mean(year_indices))
+    if fit.trend["applied"]:
+        span = (fit.year_offsets[0], fit.year_offsets[-1])
+        reach = max(max(x - span[1], span[0] - x) for x in year_indices)
+        if reach > 5:
+            warnings.warn(
+                f"The historical trend is projected {reach:.0f} years beyond the historical "
+                f"record. A trend estimated from the record becomes less reliable the further "
+                f"it is projected: in simulation, when the removed trend was not real, the "
+                f"false-alarm rate at a nominal 5% was about 8% one year beyond the record, "
+                f"11-16% five years beyond and 16-29% ten years beyond. Check the result with "
+                f"detrend_mode='none' (sensitivity_grid) and report both.",
+                UserWarning, stacklevel=2,
+            )
 
     raw = pivot.to_numpy(dtype="float64")
     use_log = fit.trend["log_space"]
@@ -885,14 +923,14 @@ def test_treatment(fit: TideFit, treatment_df: pd.DataFrame,
 
     sustained = {}
     for k in (run_lengths or []):
-        obs_w = _window_scores(z_obs, k, alternative)[0]
+        obs_w = _window_scores(z_obs, k, alternative, fit.bins)[0]
         if not np.any(np.isfinite(obs_w)):
             raise ValueError(
                 f"No run of {k} consecutive bins is free of missing data in the "
                 f"treatment period. Use a shorter run_length or more complete data."
             )
         start = int(np.argmax(obs_w))
-        null_w = _window_scores(null_z, k, alternative).max(axis=1)
+        null_w = _window_scores(null_z, k, alternative, fit.bins).max(axis=1)
         sustained[k] = SustainedResult(
             run_length=k,
             p_value=float((np.sum(null_w >= obs_w[start]) + 1) / (B + 1)),

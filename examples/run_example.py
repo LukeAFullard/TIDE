@@ -136,6 +136,8 @@ ax.figure.savefig(os.path.join(OUT_DIR, "cumulative_plot.png"), dpi=150)
 # ---------------------------------------------------------------------------
 # 7. MonitoringSeries: check each new year as it arrives, with a 5% budget
 #    for the whole 10-year horizon (0.5% per check). Save between runs.
+#    These are freshly simulated years (only 2022 changed), separate from
+#    the 2021 data tested above.
 # ---------------------------------------------------------------------------
 
 series = MonitoringSeries(fit, alpha_total=0.05, n_years_horizon=10)
@@ -151,7 +153,9 @@ ax.figure.savefig(os.path.join(OUT_DIR, "monitoring_plot.png"), dpi=150)
 
 # ---------------------------------------------------------------------------
 # 8. Power: what size of change could this record detect? Effects are in the
-#    data's units (log units if detrend_mode="log_additive").
+#    data's units (log units if detrend_mode="log_additive"). The rate at
+#    +0.0 is the false-alarm rate, about alpha (0.05) give or take a point
+#    or two of random-draw noise.
 # ---------------------------------------------------------------------------
 
 power = estimate_power(fit, effect_sizes=[0.0, 0.5, 1.0, 1.5, 2.0], n_simulations=400, rng=1)

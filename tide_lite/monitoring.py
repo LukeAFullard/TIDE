@@ -16,7 +16,7 @@ The catch is the "if": each check is tested far out in the tail of the
 null distribution (0.0025 for alpha_total=0.05 over 20 years), and a null
 built from N historical years is least accurate there. Measured over a
 10-check horizon with a 5% budget, the chance of ever flagging a normal
-year was up to 15% with 10 years of history and 5-10% with 20-40 years
+year was up to 12% with 10 years of history and 5-10% with 20-40 years
 (METHODS.md section 4). Use 20+ years and n_bootstrap >= 4000, and treat
 the budget as approximate.
 
@@ -88,7 +88,7 @@ class MonitoringSeries:
                 f"MonitoringSeries is fitted on {len(fit.years_used)} historical years. "
                 f"Its per-check threshold ({self.alpha_per_check:.4f}) is far into the "
                 f"tail of the null, which a short record cannot pin down: in simulation "
-                f"a 5% budget over 10 checks ran at up to 15% with 10 years of history "
+                f"a 5% budget over 10 checks ran at up to 12% with 10 years of history "
                 f"(up to about 10% with 20-40). Use 20+ years and treat the budget as "
                 f"approximate (METHODS.md section 4).",
                 UserWarning, stacklevel=2,

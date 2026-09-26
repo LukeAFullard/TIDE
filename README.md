@@ -59,17 +59,18 @@ stability under other reasonable settings (`sensitivity_grid`).
 ## How much can you trust it?
 
 Measured by simulation (`tests/calibration_study.py`): with 5–40 years of
-history, the test flagged **3.4%–7.1% of genuinely normal years at a
+history, the test flagged **2.6%–6.6% of genuinely normal years at a
 stated 5%**. That covers whole-year shifts, trends, skewed data, monthly
-grab samples and part years. Details, assumptions and limitations are in
-`METHODS.md`.
+grab samples, part years and averages of several years. Details,
+assumptions and limitations are in `METHODS.md`, which also sets out what
+a reviewer or court is likely to ask about a result (section 7).
 
 ## Install and check
 
 ```
 pip install -e .                  # numpy, pandas, scipy, matplotlib
 python examples/run_example.py    # tutorial on synthetic data; writes example plots
-python -m pytest tests/ -q        # 57 checks, about 30 seconds
+python -m pytest tests/ -q        # 62 checks, about 30 seconds
 ```
 
 ## Documents
@@ -79,7 +80,7 @@ python -m pytest tests/ -q        # 57 checks, about 30 seconds
 | `QUICKSTART.md` | A first result in 5 minutes |
 | `USER_GUIDE.md` | Preparing data, choosing settings and modes, reading results, troubleshooting |
 | `METHODS.md` | Every step of the method, its assumptions, measured error rates, references |
-| `CHANGELOG.md` | What changed between versions (re-run results from 0.2.0) |
+| `CHANGELOG.md` | What changed between versions (re-run results from earlier versions) |
 | `examples/run_example.py` | Every feature, end to end, on synthetic data |
 
 ## Layout

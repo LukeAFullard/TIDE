@@ -30,11 +30,22 @@ def summarize(fit: TideFit, result: TideResult, alpha: float = 0.05) -> str:
     direction = {"two-sided": "higher or lower than", "greater": "higher than",
                  "less": "lower than"}[result.alternative]
     first, last = fit.years_used[0], fit.years_used[-1]
+    period = ", ".join(map(str, years))
+    if result.mode == "confidence":
+        period = f"the average of {period}"
+    floor = 1.0 / (result.n_reference + 1)
+    if result.p_value <= floor * (1 + 1e-9):
+        p_text = (f"p <= {floor:.2g}, the smallest value {result.n_reference} "
+                  f"synthetic years can give")
+    else:
+        p_text = f"p = {result.p_value:.4g}"
+    answer = ("YES: the period was outside the site's normal range" if sig else
+              "NO: no departure from the site's normal range was detected")
     out = [
-        f"Question: were {', '.join(map(str, years))} values {direction} the site's "
+        f"Question: were {period} values {direction} the site's "
         f"normal range ({len(fit.years_used)} historical years, {first}-{last})?",
-        f"Answer: {'YES' if sig else 'NO'} at alpha={alpha} "
-        f"(p = {result.p_value:.4g}; {'at most' if sig else 'more than'} alpha).",
+        f"Answer: {answer} at alpha={alpha} "
+        f"({p_text}; {'at most' if sig else 'more than'} alpha).",
     ]
     flagged = bin_significant(result, alpha)
     if sig:
@@ -56,7 +67,9 @@ def summarize(fit: TideFit, result: TideResult, alpha: float = 0.05) -> str:
     if fit.trend["applied"]:
         unit = "log units" if fit.trend["log_space"] else f"{fit.value_col}"
         notes.append(f"A historical trend of {fit.trend['slope_per_year']:+.3g} {unit}/year was "
-                     f"removed (Mann-Kendall p={fit.trend['mk_p']:.3f}) and projected to the tested year.")
+                     f"removed (Mann-Kendall p={fit.trend['mk_p']:.3f}) and projected to the tested year, "
+                     f"so the trend continuing counts as normal. If the question is change from "
+                     f"the historical level itself, use detrend_mode='none'.")
     if len(fit.years_used) < 10:
         notes.append(f"Only {len(fit.years_used)} historical years: only large changes are detectable.")
     if fit.between_year_var_frac >= 0.5:

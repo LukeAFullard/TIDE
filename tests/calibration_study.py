@@ -3,7 +3,7 @@ Calibration study: how often does the test flag a year that is genuinely
 normal? This is the evidence behind the error-rate tables in METHODS.md
 section 4. Not part of the pytest suite (it takes several minutes); run:
 
-    python tests/calibration_study.py            # full study, ~5 min on 4 cores
+    python tests/calibration_study.py            # full study, ~10 min on 4 cores
     python tests/calibration_study.py --quick    # fewer trials, ~1-2 min
 
 How it works: simulate a site's history from a known process, fit it, then
@@ -112,8 +112,15 @@ def _monitor(args):
     return flagged
 
 
-def fmt(p, alphas=(0.10, 0.05, 0.01)):
-    return "  ".join(f"{np.mean(p <= a * (1 + 1e-9)):.3f}" for a in alphas)
+def fmt(p, k, alphas=(0.10, 0.05, 0.01)):
+    """Rates at each alpha, then the standard error of the 5% rate. Trials
+    from one simulated history are not independent (a history's own rate
+    varies, 0-16% at 5% for 9 in 10 histories of 10 years), so the SE is computed across histories,
+    from the rate within each block of k trials."""
+    rates = "  ".join(f"{np.mean(p <= a * (1 + 1e-9)):.3f}" for a in alphas)
+    per_history = (p <= 0.05 * (1 + 1e-9)).reshape(-1, k).mean(axis=1)
+    se = per_history.std(ddof=1) / np.sqrt(len(per_history))
+    return f"{rates}   (SE of 5% rate {se:.3f})"
 
 
 def main():
@@ -121,7 +128,7 @@ def main():
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--only", default="ABCDE", help="sections to run, e.g. --only D")
     args = ap.parse_args()
-    n_fits, k = (60, 10) if args.quick else (150, 10)
+    n_fits, k = (60, 10) if args.quick else (300, 10)
     t0 = time.time()
     with Pool(min(4, os.cpu_count() or 1)) as pool:
         print(f"False-alarm rate (share of normal years flagged), {n_fits * k} trials per row.")
@@ -131,14 +138,14 @@ def main():
         for n_years in ((5, 10, 20, 40) if "A" in args.only else ()):
             for ysd in (0.0, 0.5, 1.2):
                 p = run_cell(pool, n_fits, k, n_years, {"year_sd": ysd}, seed0=n_years * 10 + int(ysd * 10))
-                print(f"   {n_years:2d} years, year_sd={ysd:3.1f}:  {fmt(p[:, 0])}", flush=True)
+                print(f"   {n_years:2d} years, year_sd={ysd:3.1f}:  {fmt(p[:, 0], k)}", flush=True)
 
         print("\nB. Non-normal whole-year effects (year_sd=1.2)")
         for dist in (("t3", "skew") if "B" in args.only else ()):
             for n_years in (10, 20):
                 p = run_cell(pool, n_fits, k, n_years, {"year_sd": 1.2, "year_dist": dist},
                              seed0=500 + n_years + len(dist))
-                print(f"   {n_years:2d} years, {dist:5s}:  {fmt(p[:, 0])}", flush=True)
+                print(f"   {n_years:2d} years, {dist:5s}:  {fmt(p[:, 0], k)}", flush=True)
 
         print("\nC. Other settings and data shapes (year_sd=0.5, 10 and 20 years)")
         cases = {
@@ -157,7 +164,7 @@ def main():
                 p = run_cell(pool, n_fits, k, n_years, kw, cfg_kw, test_kw, conf_k,
                              seed0=900 + 10 * j + n_years)
                 col = -1 if "run_lengths" in test_kw else 0
-                print(f"   {name:30s} {n_years:2d} years:  {fmt(p[:, col])}", flush=True)
+                print(f"   {name:30s} {n_years:2d} years:  {fmt(p[:, col], k)}", flush=True)
 
         print("\nD. Power: share of CHANGED years flagged at alpha=0.05 (whole-year shift, or")
         print(f"   a May-Jun spike), in multiples of the typical monthly wobble ({WOBBLE})")
@@ -174,13 +181,15 @@ def main():
 
         print("\nE. MonitoringSeries: chance of EVER flagging a normal year over a 10-year")
         print("   horizon (alpha_total=0.05, so alpha 0.005 per check), n_bootstrap=4000")
-        n_m = 40 if args.quick else 100
+        n_m = 40 if args.quick else 200
         for n_years in ((10, 20, 40) if "E" in args.only else ()):
             for ysd in (0.0, 0.5):
                 res = pool.map(_monitor, [(7000 + s * 7 + n_years, n_years, 10, 3, {"year_sd": ysd})
                                           for s in range(n_m)])
-                rate = np.mean([x for chunk in res for x in chunk])
-                print(f"   {n_years:2d} years, year_sd={ysd:3.1f}:  {rate:.3f}  ({3 * n_m} horizons)",
+                per_fit = np.array([np.mean(chunk) for chunk in res])
+                rate, se = per_fit.mean(), per_fit.std(ddof=1) / np.sqrt(len(per_fit))
+                print(f"   {n_years:2d} years, year_sd={ysd:3.1f}:  {rate:.3f}  (SE {se:.3f}, "
+                      f"{3 * n_m} horizons)",
                       flush=True)
     print(f"\n({time.time() - t0:.0f} s)")
 
