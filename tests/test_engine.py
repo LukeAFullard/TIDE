@@ -5,10 +5,10 @@ other? Run with `pytest tests/test_engine.py -v`.
 
 Stochastic checks are POOLED across several simulated histories, never
 one: with ~10 historical years the false-alarm rate conditional on one
-particular history varies a lot from history to history (roughly 0-15% at
-a nominal 5%), even though it averages close to 5%. A single-history test
+particular history varies a lot from history to history (0-16% at
+a nominal 5% for 9 in 10 histories), even though it averages close to 5%. A single-history test
 would be flaky by construction. The full-size calibration study behind the
-USER_GUIDE tables is tests/calibration_study.py.
+METHODS.md tables is tests/calibration_study.py.
 """
 
 import os

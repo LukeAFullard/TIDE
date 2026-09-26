@@ -409,5 +409,77 @@ def test_summary_states_the_answer_and_how_to_reproduce_it():
     assert "Answer: YES" in text and "rng=42" in text and fit.fingerprint() in text
 
 
+def test_summary_never_reports_the_floor_p_value_as_exact():
+    """At the smallest attainable p-value the true p-value may be smaller;
+    'p = 0.004975' read as exact, and 'NO' alone was easily read as 'complied'."""
+    fit, rng = make_fit(seed=31, n_years=12, n_bootstrap=200)
+    r = test_treatment(fit, make_year(rng, next_year(fit), effect=8.0), rng=42)
+    assert r.p_value == 1 / 201
+    assert "p <= 0.005" in summarize(fit, r)
+    r0 = test_treatment(fit, make_year(rng, next_year(fit, 1)), rng=42)
+    if r0.p_value > 0.05:
+        assert "no departure from the site's normal range was detected" in summarize(fit, r0)
+
+
+# ---------------------------------------------------------------------------
+# Null distribution
+# ---------------------------------------------------------------------------
+
+def test_every_bin_is_represented_once_in_each_synthetic_year():
+    """With blocks borrowed from +/-1 neighbouring bin (the old default), the
+    first and last bins of the year appeared only ~0.6 times per synthetic
+    year, so their own variability was under-represented in the null."""
+    fit, _ = make_fit(seed=5, n_years=12, n_bootstrap=100, bin_days="month")
+    nb = len(fit.bins)
+    fit.within_year = np.tile(np.arange(nb, dtype=float), (fit.within_year.shape[0], 1))
+    out = E._stitch_within_year(fit, 3000, np.random.default_rng(0))
+    assert np.array_equal(out, np.tile(np.arange(nb, dtype=float), (3000, 1)))
+
+
+# ---------------------------------------------------------------------------
+# Sampling design
+# ---------------------------------------------------------------------------
+
+def test_sustained_window_never_spans_a_dropped_bin():
+    """With June never sampled, a 3-bin window could be May-Jul-Aug and be
+    reported as three consecutive months."""
+    rng = np.random.default_rng(7)
+    hist = pd.concat([make_year(rng, 2000 + i) for i in range(12)], ignore_index=True)
+    hist = hist[hist["date"].dt.month != 6]
+    fit = fit_historical(hist, "date", "value", TideConfig(n_bootstrap=200))
+    t = make_year(rng, 2013)
+    t.loc[t["date"].dt.month.isin([5, 7, 8]), "value"] += 6.0   # high May, Jul, Aug
+    t = t[t["date"].dt.month != 6]
+    r = test_treatment(fit, t, run_lengths=[3], rng=1)
+    w = r.sustained[3].window_bins
+    assert w[-1] - w[0] == 2, f"window {w} is not three consecutive months"
+
+
+def test_projecting_a_trend_far_beyond_the_record_warns():
+    """A removed trend projected 10 years past the record was used silently;
+    when the trend was not real, false alarms reached 16-29% at a nominal 5%."""
+    fit, rng = _trending_fit(range(2000, 2015))
+    assert fit.trend["applied"]
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        test_treatment(fit, _trending_year(rng, 2016), rng=1)
+        assert not any("projected" in str(x.message) for x in w)
+        test_treatment(fit, _trending_year(rng, 2024), rng=1)
+    assert any("projected 10 years beyond" in str(x.message) for x in w)
+
+
+def test_denser_treatment_sampling_than_history_warns():
+    """Daily data tested against a history of monthly grab samples was
+    compared silently; its monthly medians vary far less than one grab."""
+    rng = np.random.default_rng(8)
+    hist = pd.concat([make_year(rng, 2000 + i) for i in range(12)], ignore_index=True)
+    grab = hist.groupby([hist["date"].dt.year, hist["date"].dt.month]).head(1)
+    fit = fit_historical(grab, "date", "value", TideConfig(n_bootstrap=100))
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        test_treatment(fit, make_year(rng, 2013), rng=1)
+    assert any("more than twice the usual number" in str(x.message) for x in w)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

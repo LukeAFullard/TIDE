@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.4.0
+
+A further independent audit re-ran the calibration study and tested each
+part of the method separately. **Re-run results produced with 0.3.0**:
+p-values change slightly, and saved `MonitoringSeries` state from 0.3.0
+will not load against a 0.4.0 fit (the fingerprint includes the changed
+default). Measured false-alarm rates at a stated 5% went from 3.4%–7.1%
+(0.3.0) to 2.6%–6.6%; at a stated 1%, from up to 4.2% to up to 3.3%;
+three years averaged (`mode="confidence"`), from 7.5%–8.3% to 4.2%–5.8%.
+
+### Method change
+
+- **Each month is represented once in every synthetic year.** Blocks were
+  borrowed from up to one bin either side of the slot they filled
+  (`pool_window_radius=1`). They could not reach past January or December,
+  so those months' own variability appeared only about 0.6 times per
+  synthetic year, and their neighbours' 1.2 times. The default is now
+  `pool_window_radius=0`. On identical simulated data this lowered the
+  false-alarm rate in every condition tested, at a cost of 0–4 points of
+  power.
+
+### Defects fixed (each has a regression test)
+
+- A sustained-departure window could jump over a month dropped from the
+  fit (e.g. May, July, August) and be reported as consecutive months.
+- A tested period sampled much more often than the history (e.g. daily
+  sensor data against monthly grab samples) was compared silently; it now
+  warns.
+- A removed trend projected far past the record was used silently. When
+  the removed trend was not real, false alarms at a nominal 5% reached
+  16–29% ten years past the record. It now warns beyond 5 years, and
+  `METHODS.md` documents the effect.
+- `summarize` printed a p-value at its floor as if exact (`p = 0.0005`);
+  it now says `p <= 0.0005`. The answer line now says what "NO" means (no
+  departure was detected), names averaged years as an average, and notes
+  that a removed trend continuing counts as normal.
+
+### Documentation
+
+- `METHODS.md`: every screening and refusal rule is now listed; error
+  rates re-measured on twice as many trials, with their standard errors;
+  the US EPA Unified Guidance is cited as the closest established
+  practice; new section "Using a result as evidence".
+- `tests/calibration_study.py` prints the standard error of each rate.
+
 ## 0.3.0
 
 An independent audit re-measured the method's error rates instead of
